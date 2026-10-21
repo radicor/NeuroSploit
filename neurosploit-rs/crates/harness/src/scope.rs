@@ -217,6 +217,53 @@ fn normalize_url(url: &str) -> String {
     s.trim_end_matches('/').trim_start_matches("www.").to_string()
 }
 
+/// A hostname that is safe to hand to an external tool as a single argv
+/// element. Hosts come from the target (crawl output, CT logs, the scope
+/// itself), so a value like `example.com;id` or a leading `-` must never reach
+/// a process argument list — the leading dash matters even without a shell,
+/// because it turns into a tool flag (`--output`, `-oN`, ...).
+pub fn safe_host_arg(s: &str) -> Option<&str> {
+    let t = s.trim();
+    if t.is_empty() || t.len() > 253 || t.starts_with('-') {
+        return None;
+    }
+    let ok = t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    if !ok {
+        return None;
+    }
+    // No empty labels, no leading/trailing dot or dash inside a label.
+    if t.starts_with('.') || t.ends_with('.') || t.contains("..") {
+        return None;
+    }
+    Some(t)
+}
+
+/// A URL that is safe to hand to an external tool as a single argv element.
+/// Rejects anything a shell would treat as syntax as well as control
+/// characters and whitespace: these values originate in the target's own crawl
+/// output and are the highest-risk input in recon.
+///
+/// `&` is allowed: it is the normal query-string separator and is inert in an
+/// argv element (there is no shell to background a job). The characters kept in
+/// the reject list are the ones that matter once a URL is a *single argv
+/// element* — command substitution, quoting, and escapes.
+pub fn safe_url_arg(s: &str) -> Option<&str> {
+    let t = s.trim();
+    if t.is_empty() || t.len() > 8192 || t.starts_with('-') {
+        return None;
+    }
+    let bad = t
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '$' | '`' | ';' | '|' | '<' | '>' | '"' | '\'' | '\\'));
+    if bad {
+        return None;
+    }
+    if !(t.starts_with("http://") || t.starts_with("https://")) {
+        return None;
+    }
+    Some(t)
+}
+
 /// Guardrails that apply *inside* authorized scope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SoftScope {

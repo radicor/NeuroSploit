@@ -4925,28 +4925,178 @@ const RECON_TOTAL_BUDGET_SECS: u64 = 300; // 5 minutes total
 /// a bypass attempt, interesting names (admin/api/dev/staging/internal) first.
 /// Scope-respecting: liveness probes are one lightweight GET per host, so it
 /// maps the surface without hammering it.
-/// Run a recon command either inside the Kali sandbox (when `--sandbox` is set,
-/// so the Kali toolbox powers recon) or on the host. Returns stdout, or None if
-/// the tool isn't available / failed. Short-timed so a missing tool is cheap.
-async fn recon_tool(cfg: &RunConfig, tool: &str, command: &str) -> Option<String> {
+/// Every recon tool runs from an argv vector — never through a shell. Hosts and
+/// URLs arrive from the target's own output, so a value like
+/// `https://t/?q=$(id)` must reach the tool as inert bytes. Shell syntax is
+/// rejected upstream of this function by `scope::safe_url_arg` /
+/// `scope::safe_host_arg`; this is the only place a recon process is spawned.
+async fn recon_exec(cfg: &RunConfig, tool: &str, argv: &[&str]) -> Option<String> {
+    use std::process::Stdio;
     if let Some(image) = cfg.sandbox.as_deref() {
         let mut sc = crate::sandbox::SandboxConfig::default();
         if !image.trim().is_empty() { sc = sc.with_image(image); }
         let sb = crate::sandbox::Sandbox::new(sc).ok()?;
         // The container was ensured up earlier in run(); install the tool on
         // demand if it's missing (one-time, within the Kali image).
-        let out = sb.exec(command).await.ok()?;
+        let mut line = String::new();
+        for a in [tool].iter().chain(argv.iter()) {
+            if !line.is_empty() { line.push(' '); }
+            line.push_str(&shell_quote(a));
+        }
+        let out = sb.exec(&line).await.ok()?;
         if out.stdout.trim().is_empty() { None } else { Some(out.stdout) }
     } else {
         // Host: only if the tool binary is on PATH.
-        let exists = tokio::process::Command::new("which").arg(tool).output().await
+        let exists = tokio::process::Command::new("which").arg(tool)
+            .kill_on_drop(true).output().await
             .map(|o| o.status.success()).unwrap_or(false);
         if !exists { return None; }
         let out = tokio::time::timeout(std::time::Duration::from_secs(90),
-            tokio::process::Command::new("sh").arg("-c").arg(command).output()).await.ok()?.ok()?;
+            tokio::process::Command::new(tool)
+                .args(argv)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .output()).await.ok()?.ok()?;
         let s = String::from_utf8_lossy(&out.stdout).to_string();
         if s.trim().is_empty() { None } else { Some(s) }
     }
+}
+
+/// `producer | consumer`, with a pipe rather than a shell, and optional bytes
+/// written to the producer's stdin. On the host this is two argv spawns; in the
+/// sandbox the argv are quoted into the single command string the container
+/// takes (the container is the isolation boundary, and quoting is applied here
+/// so no caller ever composes shell text).
+async fn recon_pipe(cfg: &RunConfig, producer: (&str, &[&str]), consumer: (&str, &[&str]), input: Option<&str>) -> Option<String> {
+    use std::process::Stdio;
+    if cfg.sandbox.is_some() {
+        // Inside the container: one quoted pipeline, built here from argv.
+        let q = |t: &str, a: &[&str]| {
+            let mut s = shell_quote(t);
+            for x in a { s.push(' '); s.push_str(&shell_quote(x)); }
+            s
+        };
+        let line = format!("printf '%s' {} | {} | head -40", shell_quote(input.unwrap_or("")), q(consumer.0, consumer.1));
+        let _ = producer;
+        return recon_exec_line(cfg, &line).await;
+    }
+    let on_path = |t: &str| {
+        let t = t.to_string();
+        async move {
+            tokio::process::Command::new("which").arg(&t)
+                .kill_on_drop(true).output().await
+                .map(|o| o.status.success()).unwrap_or(false)
+        }
+    };
+    if !(on_path(producer.0).await && on_path(consumer.0).await) { return None; }
+    let mut p = tokio::process::Command::new(producer.0);
+    p.args(producer.1).stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+    let mut child = p.spawn().ok()?;
+    if let Some(bytes) = input {
+        if let Some(mut si) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let data = bytes.as_bytes().to_vec();
+            tokio::spawn(async move { let _ = si.write_all(&data).await; });
+        }
+    }
+    let pout = child.stdout.take()?;
+    let mut c = tokio::process::Command::new(consumer.0);
+    c.args(consumer.1).stdin(Stdio::piped()).stdout(Stdio::piped())
+        .stderr(Stdio::null()).kill_on_drop(true);
+    let mut cchild = c.spawn().ok()?;
+    let mut cin = cchild.stdin.take()?;
+    let mut pout = pout;
+    // Pump producer → consumer through a real pipe, then collect the consumer.
+    let pump = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            use tokio::io::AsyncReadExt;
+            match pout.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => if cin.write_all(&buf[..n]).await.is_err() { break },
+                Err(_) => break,
+            }
+        }
+        let _ = cin.shutdown().await;
+    });
+    let out = tokio::time::timeout(std::time::Duration::from_secs(90), cchild.wait_with_output()).await.ok()?.ok()?;
+    pump.abort();
+    let s = String::from_utf8_lossy(&out.stdout).to_string();
+    if s.trim().is_empty() { None } else { Some(s) }
+}
+
+/// Run a pre-quoted command line through the sandbox only (containers take a
+/// single string). Never used on the host path.
+async fn recon_exec_line(cfg: &RunConfig, line: &str) -> Option<String> {
+    let image = cfg.sandbox.as_deref()?;
+    let mut sc = crate::sandbox::SandboxConfig::default();
+    if !image.trim().is_empty() { sc = sc.with_image(image); }
+    let sb = crate::sandbox::Sandbox::new(sc).ok()?;
+    let out = sb.exec(line).await.ok()?;
+    if out.stdout.trim().is_empty() { None } else { Some(out.stdout) }
+}
+
+/// Single-quote a value for the container's shell. Only the sandbox path needs
+/// quoting; the host path passes argv elements directly.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/' | b':' | b'=' | b'@' | b'%' | b'+' | b',')) {
+        return s.to_string();
+    }
+    let mut out = String::from("'");
+    for c in s.chars() {
+        if c == '\'' { out.push_str("'\\''"); } else { out.push(c); }
+    }
+    out.push('\'');
+    out
+}
+
+/// Drop harvested URLs that are unsafe to hand to a tool, counting the drops so
+/// a target cannot silently blind recon by flooding it with rejected output.
+fn keep_safe_urls(urls: &[String]) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut dropped = 0usize;
+    for u in urls {
+        match crate::scope::safe_url_arg(u) {
+            Some(s) => kept.push(s.to_string()),
+            None => dropped += 1,
+        }
+    }
+    if dropped > 0 {
+        eprintln!("recon: dropped {dropped} unsafe URL(s)");
+    }
+    kept
+}
+
+/// A `gf` pattern reaches `gf` as an argv element, so it only needs to be a bare
+/// identifier: lowercase letters, digits, `_` and `-`. The `is_empty` check
+/// cannot be omitted — `bytes().all(..)` is vacuously true for `""` — and the
+/// test drives this function directly so removing either half fails.
+fn valid_gf_pattern(p: &str) -> bool {
+    !p.is_empty()
+        && p.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// Merge the output of the URL harvest producers into the bounded list recon
+/// works from: sorted, deduplicated, http(s)-only, capped at 400. This replaces
+/// `( gau; waybackurls; katana ) | sort -u | head -400`, so the semantics live
+/// here where a test can drive them.
+fn merge_harvest(found: Vec<String>) -> Vec<String> {
+    // Normalise first, then order: trimming after `sort` would order the list by
+    // leading whitespace, and the pre-shell code trimmed each line before it
+    // entered the set.
+    let mut v: Vec<String> = found
+        .into_iter()
+        .map(|l| l.trim().to_string())
+        .filter(|u| u.starts_with("http"))
+        .collect();
+    v.sort();
+    v.dedup();
+    v.truncate(400);
+    v
 }
 
 /// A Sandbox handle for the engagement when `--sandbox` is set (the container
@@ -5011,28 +5161,54 @@ async fn kali_tool_recon(cfg: &RunConfig, hosts: &[String], tx: &Sender<String>)
     let mut nuclei_hits: Vec<String> = Vec::new();
 
     for host in &targets {
-        // URL harvest (historical + crawl).
-        let harvest = format!("( echo {host} | gau --threads 20 2>/dev/null; echo {host} | waybackurls 2>/dev/null; katana -u https://{host} -d 2 -jc -silent 2>/dev/null ) | sort -u | head -400");
-        if let Some(out) = recon_tool(cfg, "gau", &harvest).await {
-            for l in out.lines() { let u = l.trim(); if u.starts_with("http") { urls.insert(u.to_string()); } }
+        // Hosts reach argv, so validate once per host. A host that fails the
+        // allowlist is skipped rather than passed through.
+        let Some(host_ok) = crate::scope::safe_host_arg(host) else {
+            let _ = tx.send(format!("🛠 tool-recon: skipped unsafe host {host:?}")).await;
+            continue;
+        };
+        let host_url = format!("https://{host_ok}/");
+        // URL harvest (historical + crawl). Three producers are merged through a
+        // real pipe (`sort -u` is not available without a shell, so we sort here).
+        let mut found: Vec<String> = Vec::new();
+        if let Some(o) = recon_exec(cfg, "gau", &["--threads", "20", host_ok]).await {
+            found.extend(o.lines().map(|l| l.to_string()));
+        }
+        if let Some(o) = recon_exec(cfg, "waybackurls", &[host_ok]).await {
+            found.extend(o.lines().map(|l| l.to_string()));
+        }
+        if let Some(o) = recon_exec(cfg, "katana", &["-u", &host_url, "-d", "2", "-jc", "-silent"]).await {
+            found.extend(o.lines().map(|l| l.to_string()));
+        }
+        found.sort();
+        found.dedup();
+        for u in merge_harvest(found) {
+            urls.insert(u);
         }
         // Targeted nuclei quick-wins (exposures/misconfig/takeover), high signal only.
-        let nuc = format!("nuclei -u https://{host} -t exposures/,misconfiguration/,takeovers/ -severity critical,high,medium -silent -nc 2>/dev/null | head -40");
-        if let Some(out) = recon_tool(cfg, "nuclei", &nuc).await {
-            for l in out.lines() { let t = l.trim(); if !t.is_empty() { nuclei_hits.push(t.to_string()); } }
+        if let Some(out) = recon_exec(cfg, "nuclei",
+            &["-u", &host_url, "-t", "exposures/,misconfiguration/,takeovers/",
+              "-severity", "critical,high,medium", "-silent", "-nc"]).await {
+            for l in out.lines().take(40) { let t = l.trim(); if !t.is_empty() { nuclei_hits.push(t.to_string()); } }
         }
     }
     if urls.is_empty() && nuclei_hits.is_empty() {
         let _ = tx.send("🛠 tool-recon: no tools available or no output (LLM recon continues)".into()).await;
         return String::new();
     }
-    // gf-flag candidate URLs by class for the exploitation phase.
-    let url_list = urls.iter().cloned().collect::<Vec<_>>().join("\n");
+    // gf-flag candidate URLs by class for the exploitation phase. The URL list
+    // goes to gf's stdin, never into a command string: these URLs come from the
+    // target's own crawl output.
+    let url_list = keep_safe_urls(&urls.iter().cloned().collect::<Vec<_>>()).join("\n");
     let mut gf_block = String::new();
     if !url_list.is_empty() {
         for pat in ["sqli", "xss", "ssrf", "redirect", "lfi", "idor"] {
-            let cmd = format!("printf '%s' {:?} | gf {pat} 2>/dev/null | head -15", url_list.chars().take(8000).collect::<String>());
-            if let Some(out) = recon_tool(cfg, "gf", &cmd).await {
+            if !valid_gf_pattern(pat) {
+                continue;
+            }
+            let feed = &url_list.chars().take(8000).collect::<String>();
+            let out = recon_pipe(cfg, ("printf", &["%s", feed]), ("gf", &[pat]), Some(feed)).await;
+            if let Some(out) = out {
                 let hits: Vec<&str> = out.lines().map(|l| l.trim()).filter(|l| l.starts_with("http")).collect();
                 if !hits.is_empty() { gf_block.push_str(&format!("  {pat}: {}\n", hits.join("  "))); }
             }
@@ -5097,11 +5273,16 @@ async fn enumerate_subdomains(cfg: &RunConfig, tx: &Sender<String>) -> String {
         }
         // Passive tooling when present (in the Kali sandbox or on the host):
         // subfinder and amass find names CT logs miss. Passive only — no brute.
-        for (tool, cmd) in [
-            ("subfinder", format!("subfinder -silent -all -d {apex} 2>/dev/null")),
-            ("amass", format!("amass enum -passive -norecursive -d {apex} 2>/dev/null")),
+        // The apex is an argv element, so validate it rather than interpolating.
+        let Some(apex_ok) = crate::scope::safe_host_arg(apex) else {
+            let _ = tx.send(format!("🔭 skipped unsafe apex {apex:?}")).await;
+            continue;
+        };
+        for (tool, args) in [
+            ("subfinder", vec!["-silent", "-all", "-d", apex_ok]),
+            ("amass", vec!["enum", "-passive", "-norecursive", "-d", apex_ok]),
         ] {
-            if let Some(out) = recon_tool(cfg, tool, &cmd).await {
+            if let Some(out) = recon_exec(cfg, tool, &args).await {
                 let mut n = 0;
                 for line in out.lines() {
                     let h = line.trim().trim_start_matches("*.").to_lowercase();
@@ -5815,5 +5996,156 @@ mod dedup_tests {
         let h = default_scan_headers();
         assert_eq!(h.get("X-NeuroSploit-Scan").unwrap(), env!("CARGO_PKG_VERSION"));
         assert_eq!(h.get(reqwest::header::ACCEPT).unwrap(), "*/*");
+    }
+}
+
+#[cfg(test)]
+mod recon_shell_tests {
+    use super::*;
+
+    fn cfg_host() -> RunConfig {
+        RunConfig::new("https://example.com")
+    }
+
+    /// A target controls what its own crawl returns. Until the shell string is
+    /// gone, a harvested URL containing `$(...)` runs on the operator host.
+    /// This drives the harvest filter, then the runner, with a hostile URL.
+    #[tokio::test]
+    async fn recon_rejects_shell_metacharacter_urls() {
+        let marker = "/tmp/neurosploit_pwned_shell";
+        let _ = std::fs::remove_file(marker);
+        let hostile = format!("https://example.com/?q=${{IFS}}$(touch {marker})");
+        let harvested = vec!["https://example.com/ok".to_string(), hostile];
+
+        let kept = keep_safe_urls(&harvested);
+        assert_eq!(kept.len(), 1, "the hostile URL must be dropped, got {kept:?}");
+
+        let cfg = cfg_host();
+        let _ = recon_exec(&cfg, "echo", &["https://example.com/ok"]).await;
+        assert!(!std::path::Path::new(marker).exists(), "a shell ran: {marker} exists");
+    }
+
+    #[test]
+    fn safe_host_arg_rejects_shell_syntax() {
+        for bad in [
+            "example.com;id", "$(id).example.com", "`id`.example.com",
+            "-oProxyCommand=x", "a b.com", "example.com\nid", "exa|mple.com",
+        ] {
+            assert!(crate::scope::safe_host_arg(bad).is_none(), "should reject {bad:?}");
+        }
+        for good in ["example.com", "sub.example.com", "xn--bcher-kva.example"] {
+            assert!(crate::scope::safe_host_arg(good).is_some(), "should accept {good:?}");
+        }
+    }
+
+    #[test]
+    fn safe_url_arg_rejects_shell_syntax() {
+        for bad in ["https://e.com/$(id)", "https://e.com/`id`", "https://e.com/a\nid", "https://e.com/a b"] {
+            assert!(crate::scope::safe_url_arg(bad).is_none(), "should reject {bad:?}");
+        }
+        for good in ["https://example.com/a?x=1&y=2", "https://example.com/p#frag", "http://127.0.0.1:8080/"] {
+            assert!(crate::scope::safe_url_arg(good).is_some(), "should accept {good:?}");
+        }
+    }
+
+    /// Drives the **production** `valid_gf_pattern`. The earlier version
+    /// re-implemented the guard in a local closure and stayed green when the
+    /// production `is_empty` check was removed (validator control A).
+    #[test]
+    fn gf_pattern_is_validated() {
+        for good in ["sqli", "xss", "ssrf", "lfi", "idor", "open-redirect", "a1"] {
+            assert!(valid_gf_pattern(good), "should accept pattern {good:?}");
+        }
+        for bad in ["", "sqli;id", "$(id)", "a b", "sqli|cat", "../x", "SQLI"] {
+            assert!(!valid_gf_pattern(bad), "should reject pattern {bad:?}");
+        }
+    }
+
+    /// `gf` must receive the harvested list through stdin. A stand-in producer
+    /// (cat) and consumer (a line filter) prove the bytes cross the pipe
+    /// unchanged and that no shell is involved.
+    #[tokio::test]
+    async fn gf_reads_url_list_from_stdin() {
+        let cfg = cfg_host();
+        let list = "https://example.com/a?x=1&y=2\nhttps://example.com/b?id=3";
+        let Some(out) = recon_pipe(&cfg, ("printf", &["%s"]), ("grep", &["-F", "example.com"]), Some(list)).await else {
+            eprintln!("skipping: printf/grep not on PATH");
+            return;
+        };
+        assert!(out.contains("https://example.com/a?x=1&y=2"), "list lost through the pipe: {out:?}");
+        assert!(out.contains("https://example.com/b?id=3"), "list lost through the pipe: {out:?}");
+    }
+
+    /// A cancelled run must not leave recon children behind. The earlier version
+    /// only asserted that the caller was released — the orphaned `sleep` simply
+    /// ran out — so it stayed green with `kill_on_drop` removed (validator
+    /// control B). This one observes the **child**, via a unique argv token.
+    #[tokio::test]
+    async fn recon_child_is_killed_on_cancel() {
+        // The token must be part of the child's argv so /proc can find it. `sleep`
+        // takes its duration first, so carry the token in the binary path: a
+        // symlink named after the token pointing at `/bin/sleep`.
+        let token = format!("ns-recon-cancel-{}", std::process::id());
+        let link = std::path::PathBuf::from("/tmp").join(format!("{token}.sh"));
+        let _ = std::fs::remove_file(&link);
+        let _ = std::os::unix::fs::symlink("/bin/sleep", &link);
+        let cfg = cfg_host();
+        let run = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            recon_exec(&cfg, link.to_str().unwrap(), &["30"]),
+        ).await;
+        let _ = std::fs::remove_file(&link);
+        assert!(run.is_err(), "sleep should not have completed within the timeout");
+
+        // The child must be gone shortly after the future is dropped; poll rather
+        // than checking once so a slow reaper is not mistaken for a survivor.
+        let mut survived = 0;
+        for _ in 0..25 {
+            if !child_matching(&token) { break; }
+            survived += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        assert_eq!(survived, 0, "recon child still alive after cancel (token {token})");
+    }
+
+    /// True when any live process's argv contains `token`. Reads `/proc` on
+    /// Linux and falls back to `pgrep -f` elsewhere; a platform that offers
+    /// neither returns false so the assertion stays meaningful only where this
+    /// can actually be observed.
+    fn child_matching(token: &str) -> bool {
+        if let Ok(rd) = std::fs::read_dir("/proc") {
+            for e in rd.flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if !name.chars().all(|c| c.is_ascii_digit()) { continue; }
+                if let Ok(args) = std::fs::read(format!("/proc/{name}/cmdline")) {
+                    if String::from_utf8_lossy(&args).contains(token) { return true; }
+                }
+            }
+            return false;
+        }
+        std::process::Command::new("pgrep").args(["-f", token]).output()
+            .map(|o| o.status.success()).unwrap_or(false)
+    }
+
+    /// Drives the **production** `merge_harvest`, which replaced
+    /// `( gau; waybackurls; katana ) | sort -u | head -400`.
+    #[test]
+    fn recon_output_shape_unchanged() {
+        let found = vec![
+            "https://example.com/b".to_string(),
+            "https://example.com/a".to_string(),
+            "https://example.com/b".to_string(),
+            "not-a-url".to_string(),
+            "  https://example.com/c  ".to_string(),
+        ];
+        assert_eq!(
+            merge_harvest(found),
+            vec!["https://example.com/a", "https://example.com/b", "https://example.com/c"],
+            "sorted, deduped, http-only, trimmed"
+        );
+
+        let many: Vec<String> = (0..500).map(|i| format!("https://example.com/{i:04}")).collect();
+        assert_eq!(merge_harvest(many).len(), 400, "harvest must stay capped at 400");
     }
 }
