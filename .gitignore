@@ -112,3 +112,9 @@ target/
 articles/
 benchmarks/
 examples/scopes/rockstargames.yaml
+
+# Private operator notes: roadmap, DAG manifest, security remediation tracking,
+# Orion spec/validation artifacts. Not part of the upstream product; kept out of
+# CI and release artifacts.
+.agents/
+specs/
