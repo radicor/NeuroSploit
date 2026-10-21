@@ -461,17 +461,26 @@ pub fn spec_of(x: &Exchange) -> ReqSpec {
     }
 }
 
+/// Cut `s` to at most `cap` bytes without splitting a character. Targets send
+/// arbitrary bytes, and a byte slice panics when the cut lands mid-character.
+pub fn truncate_str(s: &str, cap: usize) -> &str {
+    if s.len() <= cap {
+        return s;
+    }
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn truncate(s: &str, cap: usize) -> String {
     if s.len() <= cap {
         return s.to_string();
     }
     // Cut on a character boundary, then say so — a silently clipped body would
     // make a length differential meaningless.
-    let mut end = cap;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n…[truncated at {cap} bytes by the replay engine]", &s[..end])
+    format!("{}\n…[truncated at {cap} bytes by the replay engine]", truncate_str(s, cap))
 }
 
 #[cfg(test)]
@@ -535,6 +544,19 @@ mod tests {
         // Multi-byte safety: cutting mid-character would panic on slicing.
         let multi = "é".repeat(BODY_CAP);
         assert!(!truncate(&multi, BODY_CAP - 1).is_empty());
+    }
+
+    #[test]
+    fn truncate_str_stops_on_a_boundary_and_never_grows() {
+        // 3-byte characters: every cap that is not a multiple of 3 must back off.
+        let cjk = "日本語abc";
+        for cap in 0..cjk.len() {
+            let got = truncate_str(cjk, cap);
+            assert!(got.len() <= cap);
+            assert!(cjk.starts_with(got), "cap {cap} produced a non-prefix");
+        }
+        assert_eq!(truncate_str(cjk, cjk.len()), cjk);
+        assert_eq!(truncate_str(cjk, 999), cjk, "cap above length is a no-op");
     }
 
     #[test]

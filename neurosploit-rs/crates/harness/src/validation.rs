@@ -274,6 +274,12 @@ const DB_ERRORS: &[&str] = &[
     "postgresql query failed", "supplied argument is not a valid mysql",
 ];
 
+/// Bounds for `semantic_overlap`. Both bodies are target-controlled, so the
+/// comparison scans a fixed head and a fixed token count; ordinary pages sit far
+/// below both, which keeps their ratio identical to the unbounded formula.
+const MAX_OVERLAP_BYTES: usize = 96 * 1024;
+const MAX_OVERLAP_TOKENS: usize = 1024;
+
 pub fn diff(baseline: &Exchange, attack: &Exchange) -> Diff {
     let b_len = baseline.len() as i64;
     let a_len = attack.len() as i64;
@@ -1049,7 +1055,10 @@ impl CweValidator for SessionFixationValidator {
             return Verdict::NeedsReview("no session cookie was captured on one of the two responses".into());
         };
         if pre == post {
-            Verdict::Confirmed(format!("the session id survived authentication unchanged ({}…)", &pre[..pre.len().min(8)]))
+            // Chars, not bytes: the target owns this cookie, and a byte slice
+            // panics when byte 8 lands mid-character.
+            let preview: String = pre.chars().take(8).collect();
+            Verdict::Confirmed(format!("the session id survived authentication unchanged ({preview}…)"))
         } else {
             Verdict::Rejected("the session id was regenerated at login — fixation is prevented".into())
         }
@@ -1190,6 +1199,12 @@ fn session_id(header: &str) -> Option<String> {
 /// record" from "a login page with a 200 status", which is the distinction that
 /// decides an IDOR.
 fn semantic_overlap(a: &str, b: &str) -> f64 {
+    // A target controls both bodies, so the work here must be bounded by the
+    // engine's body cap rather than by whatever the page contains. Scan the
+    // comparable head of each side and stop after MAX_TOKENS distinct tokens;
+    // normal pages are far below both limits, so their ratio is unchanged.
+    let a = crate::replay::truncate_str(a, MAX_OVERLAP_BYTES);
+    let b = crate::replay::truncate_str(b, MAX_OVERLAP_BYTES);
     let toks: Vec<&str> = a
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| t.len() >= 4)
@@ -1200,6 +1215,7 @@ fn semantic_overlap(a: &str, b: &str) -> f64 {
     let mut distinct: Vec<&str> = toks;
     distinct.sort_unstable();
     distinct.dedup();
+    distinct.truncate(MAX_OVERLAP_TOKENS);
     let hits = distinct.iter().filter(|t| b.contains(**t)).count();
     hits as f64 / distinct.len() as f64
 }
@@ -2273,6 +2289,49 @@ mod tests {
         assert!(matches!(judge(&f("CWE-384", "Session fixation"), Some(&ev2)), Verdict::Rejected(_)));
     }
 
+    /// A target controls its own cookies. A session id whose 8th byte lands
+    /// mid-character used to panic the validator on `&pre[..8]`, aborting the
+    /// whole run from a hostile `Set-Cookie`.
+    #[test]
+    fn session_fixation_survives_a_non_ascii_session_id() {
+        let before = exh(200, "", &[("Set-Cookie", "sessionid=日本語abcdef; Path=/")]);
+        let after_same = exh(302, "", &[("Set-Cookie", "sessionid=日本語abcdef; Path=/")]);
+        let ev = Evidence { baseline: Some(before), attack: Some(after_same), ..Default::default() };
+        match judge(&f("CWE-384", "Session fixation"), Some(&ev)) {
+            Verdict::Confirmed(r) => assert!(r.starts_with("the session id survived"), "{r}"),
+            v => panic!("same non-ASCII session id on both sides is still fixation: {v:?}"),
+        }
+    }
+
+    #[test]
+    fn session_fixation_handles_a_session_id_shorter_than_the_preview() {
+        let before = exh(200, "", &[("Set-Cookie", "sid=ab; Path=/")]);
+        let after = exh(302, "", &[("Set-Cookie", "sid=ab; Path=/")]);
+        let ev = Evidence { baseline: Some(before), attack: Some(after), ..Default::default() };
+        assert!(matches!(judge(&f("CWE-384", "Session fixation"), Some(&ev)), Verdict::Confirmed(_)));
+    }
+
+    #[test]
+    fn session_fixation_preview_is_bounded_by_characters_not_bytes() {
+        // 30 CJK chars = 90 bytes; the preview must be 8 chars, not a byte slice.
+        let id = "セッション識別子文字列日本語表示";
+        let before = exh(200, "", &[("Set-Cookie", &format!("sessionid={id}; Path=/"))]);
+        let after = exh(302, "", &[("Set-Cookie", &format!("sessionid={id}; Path=/"))]);
+        let ev = Evidence { baseline: Some(before), attack: Some(after), ..Default::default() };
+        match judge(&f("CWE-384", "Session fixation"), Some(&ev)) {
+            Verdict::Confirmed(r) => assert!(r.contains(&id.chars().take(8).collect::<String>()), "{r}"),
+            v => panic!("expected confirmed: {v:?}"),
+        }
+    }
+
+    #[test]
+    fn session_fixation_rejects_a_regenerated_non_ascii_id() {
+        let before = exh(200, "", &[("Set-Cookie", "sessionid=日本語abcdef; Path=/")]);
+        let after = exh(302, "", &[("Set-Cookie", "sessionid=日本語zzzzzz; Path=/")]);
+        let ev = Evidence { baseline: Some(before), attack: Some(after), ..Default::default() };
+        assert!(matches!(judge(&f("CWE-384", "Session fixation"), Some(&ev)), Verdict::Rejected(_)));
+    }
+
     #[test]
     fn mass_assignment_needs_the_read_back_not_just_a_200() {
         let marker = canary("nsma");
@@ -2477,6 +2536,39 @@ mod tests {
         nostore.request_headers.insert("authorization".into(), "Bearer x".into());
         let ev2 = Evidence { attack: Some(nostore), ..Default::default() };
         assert!(matches!(judge(&f("CWE-525", "cacheable"), Some(&ev2)), Verdict::Rejected(_)));
+    }
+
+    /// The similarity helper is a false-positive guard, so its ratio must stay
+    /// meaningful for ordinary bodies and must not do unbounded work for large
+    /// adversarial ones: `distinct.iter().filter(|t| b.contains(**t))` is
+    /// O(tokens × body) and a target-controlled page can carry tens of thousands
+    /// of unique tokens.
+    #[test]
+    fn semantic_overlap_ratio_is_unchanged_for_normal_bodies() {
+        let owner = "account owner dashboard balance 12345 transactions recent activity";
+        let login = "please sign in username password forgot your password";
+        assert_eq!(semantic_overlap(owner, owner), 1.0);
+        assert_eq!(semantic_overlap(owner, login), 0.0);
+        let partial = "account owner dashboard balance 99999 totally different content here";
+        let r = semantic_overlap(owner, partial);
+        assert!(r > 0.0 && r < 1.0, "partial overlap should be fractional, got {r}");
+    }
+
+    #[test]
+    fn semantic_overlap_is_bounded_on_a_huge_adversarial_body() {
+        // 60k unique 8-char tokens (~540 KB): the old scan is ~O(60k × 540KB).
+        let a: String = (0..60_000u32).map(|i| format!("tok{:08x} ", i)).collect();
+        let b: String = (60_000..120_000u32).map(|i| format!("tok{:08x} ", i)).collect();
+        let started = std::time::Instant::now();
+        let _ = semantic_overlap(&a, &b);
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(2), "overlap scan took {elapsed:?}");
+    }
+
+    #[test]
+    fn semantic_overlap_empty_and_tokenless_inputs_are_zero() {
+        assert_eq!(semantic_overlap("", ""), 0.0);
+        assert_eq!(semantic_overlap("a b c", "a b c"), 0.0, "tokens under 4 chars are ignored");
     }
 
 }

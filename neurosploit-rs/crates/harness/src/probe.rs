@@ -157,34 +157,60 @@ fn attr(tag: &str, name: &str) -> String {
 /// `application-name` meta, else a "© <Name>" / "Copyright <Name>" notice. Helps
 /// the report name the organisation/product instead of only the URL.
 fn extract_brand(body: &str) -> String {
-    let low = body.to_lowercase();
+    brand_after(body)
+}
+
+/// Same as `extract_brand`, on a bounded head of the body.
+///
+/// The mirror used for case-insensitive search is `to_ascii_lowercase`, not
+/// `to_lowercase`: ASCII lowercasing never changes byte length ('İ' stays two
+/// bytes, 'ẞ' stays three), so every byte offset in the mirror addresses the
+/// same byte in the original and hits can be sliced back out of `head` with
+/// their original casing intact.
+fn brand_after(body: &str) -> String {
+    let head = &body[..first_boundary_at_or_before(body, 4 * 1024 * 1024)];
+    let head_low = head.to_ascii_lowercase();
     // <meta property="og:site_name" content="X"> / name="application-name"
     for key in ["og:site_name", "application-name", "author", "twitter:site"] {
-        if let Some(i) = low.find(key) {
-            let seg = &body[i..(i + 220).min(body.len())];
-            if let Some(c) = between(seg, "content=\"", "\"").or_else(|| between(seg, "content='", "'")) {
-                let c = c.trim();
-                if c.len() >= 2 && c.len() <= 60 { return c.to_string(); }
-            }
+        let Some(i) = head_low.find(key) else { continue };
+        let rest = &head[i..];
+        let tail = &rest[..first_boundary_at_or_before(rest, 220)];
+        if let Some(c) = between(tail, "content=\"", "\"").or_else(|| between(tail, "content='", "'")) {
+            let c = c.trim();
+            if c.len() >= 2 && c.len() <= 60 { return c.to_string(); }
         }
     }
-    // Copyright notice: "© Company" or "Copyright 2024 Company".
+    // Copyright notice: "© Company" or "Copyright 2024 Company". `copyright` is
+    // matched case-insensitively through the offset-safe mirror; `©` and
+    // `&copy;` are ASCII-lowercase-stable so they match either way.
     for marker in ["©", "&copy;", "copyright"] {
-        if let Some(i) = low.find(marker) {
-            let seg: String = body[i..].chars().take(80).collect();
-            // strip the marker + a year, take the first capitalised words.
-            let cleaned = seg.replace('©', " ").replace("&copy;", " ");
-            let cleaned = cleaned.trim_start_matches(|c: char| !c.is_alphabetic());
-            let name: String = cleaned.split(['<', '.', '|', '\n'])
-                .next().unwrap_or("").chars().filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '&' || *c == '-')
-                .collect::<String>().trim().to_string();
-            // drop a leading year like "2024 "
-            let name = name.split_whitespace().filter(|w| !w.chars().all(|c| c.is_ascii_digit()))
-                .collect::<Vec<_>>().join(" ");
-            if name.len() >= 2 && name.len() <= 50 && name.to_lowercase() != "copyright" { return name; }
-        }
+        let Some(i) = head_low.find(marker) else { continue };
+        let seg: String = head[i..].chars().take(80).collect();
+        // strip the marker + a year, take the first capitalised words.
+        let cleaned = seg.replace('©', " ").replace("&copy;", " ");
+        let cleaned = cleaned.trim_start_matches(|c: char| !c.is_alphabetic());
+        let name: String = cleaned.split(['<', '.', '|', '\n'])
+            .next().unwrap_or("").chars().filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '&' || *c == '-')
+            .collect::<String>().trim().to_string();
+        // drop a leading year like "2024 "
+        let name = name.split_whitespace().filter(|w| !w.chars().all(|c| c.is_ascii_digit()))
+            .collect::<Vec<_>>().join(" ");
+        if name.len() >= 2 && name.len() <= 50 && name.to_lowercase() != "copyright" { return name; }
     }
     String::new()
+}
+
+/// Largest index `<= cap` that is a char boundary, so slicing never panics on
+/// attacker-supplied multi-byte text.
+fn first_boundary_at_or_before(s: &str, cap: usize) -> usize {
+    if cap >= s.len() {
+        return s.len();
+    }
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 /// Best-effort parse of the HTML `<form>`s on a page so agents can auto-submit
@@ -304,7 +330,7 @@ pub async fn probe(target: &str) -> Probe {
 
     // Body-derived facts (bounded).
     let body = resp.text().await.unwrap_or_default();
-    let body = if body.len() > 400_000 { body[..400_000].to_string() } else { body };
+    let body = crate::replay::truncate_str(&body, 400_000).to_string();
     if let Some(t) = between(&body, "<title>", "</title>") {
         p.title = t.trim().chars().take(120).collect();
     }
@@ -403,7 +429,7 @@ pub fn probe_summary(p: &Probe) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_forms;
+    use super::{parse_forms, brand_after};
 
     #[test]
     fn parses_register_form_fields_and_kind() {
@@ -434,5 +460,66 @@ mod tests {
         let html = r#"<form action="/login"><input name="user"><input type="password" name="pw"></form>"#;
         let f = parse_forms(html);
         assert_eq!(f[0].kind, "login");
+    }
+
+    /// `to_lowercase` can change a string's byte length ('İ' → 2 bytes, 'ẞ' → 3),
+    /// so an offset found in the lowercased copy does not address the same
+    /// position in the original. A target that ships such a page used to panic
+    /// the probe on `&body[i..]`.
+    #[test]
+    fn brand_survives_a_lowercase_length_change() {
+        // 400 'İ' (2 bytes lowercased each) before the marker: the lowercased
+        // index is ~400 bytes past the same position in the original.
+        let body = format!("{}<meta property=\"og:site_name\" content=\"Acme\">", "İ".repeat(400));
+        assert_eq!(brand_after(&body), "Acme");
+    }
+
+    #[test]
+    fn brand_reads_ordinary_markup() {
+        let body = r#"<meta property="og:site_name" content="Example Corp">"#;
+        assert_eq!(brand_after(body), "Example Corp");
+    }
+
+    #[test]
+    fn brand_returns_empty_when_nothing_matches() {
+        assert_eq!(brand_after("<html><body>nothing here</body></html>"), "");
+    }
+
+    #[test]
+    fn brand_reads_a_capitalised_copyright_notice() {
+        // HEAD matched "copyright" against the lowercased body, so these were
+        // detected before the offset fix. A case-sensitive search silently
+        // regressed them. The marker word itself is NOT stripped by the
+        // pre-existing cleanup (HEAD yields "Copyright Acme Corp"), so these
+        // assert detection + year removal, not a prettier name.
+        assert_eq!(brand_after("<p>Copyright 2026 Acme Corp</p>"), "Copyright Acme Corp");
+        assert_eq!(brand_after("<footer>COPYRIGHT 2026 Acme Corp</footer>"), "COPYRIGHT Acme Corp");
+        assert_eq!(brand_after("<p>copyright 2026 Acme Corp</p>"), "copyright Acme Corp");
+    }
+
+    /// Uppercase `CONTENT=` was never supported — HEAD returns "" for it too,
+    /// because the delimiter search is case-sensitive. Recorded so the limit is
+    /// visible and the behaviour cannot drift silently in either direction.
+    #[test]
+    fn brand_uppercase_content_attribute_is_unsupported() {
+        let body = r#"<META PROPERTY="OG:SITE_NAME" CONTENT="Acme Corp">"#;
+        assert_eq!(brand_after(body), "");
+        // Mixed case: key uppercase, delimiter lowercase — the mirror finds the
+        // key and the value keeps its original casing.
+        let mixed = r#"<META PROPERTY="OG:SITE_NAME" content="Acme Corp">"#;
+        assert_eq!(brand_after(mixed), "Acme Corp");
+    }
+
+    #[test]
+    fn brand_reads_a_capitalised_copyright_after_a_length_changing_prefix() {
+        // Both defects at once: expanding-lowercase prefix AND capitalised marker.
+        let body = format!("{}<p>Copyright 2026 Acme Corp</p>", "İ".repeat(200));
+        assert_eq!(brand_after(&body), "Copyright Acme Corp");
+    }
+
+    #[test]
+    fn brand_reads_a_copyright_notice_past_a_length_changing_prefix() {
+        let body = format!("{}<p>&copy; 2026 Acme Widgets</p>", "ẞ".repeat(300));
+        assert_eq!(brand_after(&body), "Acme Widgets");
     }
 }
