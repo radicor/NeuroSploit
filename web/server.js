@@ -155,6 +155,135 @@ function metaPayload(remoteAddress) {
 }
 
 // ---------------------------------------------------------------------------
+// Input validation (SEC-002). The console turns client JSON into CLI argv and
+// REPL commands, so every free-text value and every filesystem path is checked
+// here, once, rather than per handler. Validators return {ok, value, error};
+// the require* wrappers throw a 400-shaped error the route layer maps directly.
+// ---------------------------------------------------------------------------
+
+// Wizard modes only. Verified against the CLI's clap subcommands: `cloud` is a
+// UI alias that buildArgs maps to `host`, so it must pass this set BEFORE the
+// mapping, and `skills` is a real subcommand the wizard can launch. Everything
+// else in the CLI (mcp, container, mobile, capability, internal, tui, …) is not
+// something the console offers, and letting it through chose a subcommand by
+// client input.
+const MODE_ALLOWLIST = new Set(['run', 'whitebox', 'greybox', 'host', 'aitest', 'skills', 'cloud']);
+
+function badInput(field, message) {
+  const err = new Error(`${field}: ${message}`);
+  err.status = 400;
+  err.field = field;
+  return err;
+}
+
+// A bare slash-word at the start of a value would be read as a REPL command if
+// it ever landed at the start of a line. A path like /etc/creds.yaml or
+// /tmp/x/y is not a bare word, so it stays legal.
+const REPL_COMMAND_SHAPE = /^\/[a-z][a-z-]*$/;
+
+function checkPositional(value, field) {
+  if (value === undefined || value === null) return { ok: false, error: 'value is required' };
+  if (typeof value !== 'string') return { ok: false, error: 'value must be a string' };
+  const v = value.trim();
+  if (!v) return { ok: false, error: 'value is empty' };
+  if (v.length > 4096) return { ok: false, error: 'value is too long (max 4096)' };
+  if (v.startsWith('-')) return { ok: false, error: 'value must not start with "-" (it would be read as a flag)' };
+  // C0 controls, including \r and \n: a newline in an argv element is inert, but
+  // the REPL path and log lines are not, so reject them at the boundary.
+  if (/[\u0000-\u001f\u007f]/.test(v)) return { ok: false, error: 'value must not contain control characters' };
+  return { ok: true, value: v };
+}
+
+function safeReplValue(value, field) {
+  const base = checkPositional(value, field);
+  if (!base.ok) return base;
+  const first = base.value.split(/\s+/)[0];
+  if (first && REPL_COMMAND_SHAPE.test(first)) {
+    return { ok: false, error: `value must not start with the REPL command ${first}` };
+  }
+  return base;
+}
+
+function requirePositional(value, field) {
+  const r = checkPositional(value, field);
+  if (!r.ok) throw badInput(field, r.error);
+  return r.value;
+}
+
+function requireReplValue(value, field) {
+  const r = safeReplValue(value, field);
+  if (!r.ok) throw badInput(field, r.error);
+  return r.value;
+}
+
+// Per-server temp root: mkdtemp is 0700 by construction, unlike the shared
+// os.tmpdir()/neurosploit-web directory this replaces.
+let TEMP_ROOT = null;
+function tempRoot() {
+  if (!TEMP_ROOT) TEMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'neurosploit-web-'));
+  return TEMP_ROOT;
+}
+
+/// Roots a filesystem path from the client may live under. The temp root is
+/// included because materialize*() hands the CLI files the server just wrote.
+function allowedPathRoots() {
+  const roots = [process.cwd(), ROOT, tempRoot()];
+  const extra = (process.env.NEUROSPLOIT_WEB_PATH_ROOT || '')
+    .split(path.delimiter).map((s) => s.trim()).filter(Boolean);
+  return roots.concat(extra);
+}
+
+/// Resolve `p` and require it to sit inside one of `roots`. realpath runs first
+/// so a symlink cannot point out of a root, and the comparison appends the
+/// separator so /tmp/eng does not admit /tmp/engx.
+function confinePath(p, { roots, mustExist = true } = {}) {
+  if (typeof p !== 'string' || !p.trim()) return { ok: false, error: 'path is empty' };
+  if (!Array.isArray(roots) || !roots.length) return { ok: false, error: 'no allowed roots configured' };
+  const realRoots = roots.map((r) => {
+    try { return fs.realpathSync(r); } catch { return path.resolve(r); }
+  });
+  const candidate = path.isAbsolute(p) ? p : path.join(realRoots[0], p);
+  let resolved;
+  try {
+    resolved = fs.realpathSync(candidate);
+  } catch (e) {
+    if (e.code === 'ENOENT') return { ok: false, error: `path does not exist: ${p}` };
+    return { ok: false, error: e.message };
+  }
+  for (const r of realRoots) {
+    if (resolved === r || resolved.startsWith(r + path.sep)) return { ok: true, value: resolved };
+  }
+  return { ok: false, error: `path is outside the allowed roots: ${p}` };
+}
+
+function requireConfinedPath(p, field) {
+  const r = confinePath(p, { roots: allowedPathRoots() });
+  if (!r.ok) throw badInput(field, r.error);
+  return r.value;
+}
+
+/// A run id names a directory under RUNS_DIR. Anything with a separator, a dot
+/// segment or a NUL is refused before the path is built.
+function resolveRunDir(id) {
+  if (typeof id !== 'string' || !id) return { ok: false, error: 'run id is required' };
+  if (!/^[A-Za-z0-9._-]+$/.test(id)) return { ok: false, error: 'run id contains unsupported characters' };
+  if (id === '.' || id === '..') return { ok: false, error: 'run id is not a directory name' };
+  const base = path.resolve(RUNS_DIR);
+  const dir = path.resolve(base, id);
+  if (!dir.startsWith(base + path.sep)) return { ok: false, error: 'run id escapes the runs directory' };
+  return { ok: true, value: dir };
+}
+
+/// Remove the files materialize*() wrote for one job.
+function cleanupJobTemp(jobId) {
+  const root = TEMP_ROOT;
+  if (!root) return;
+  for (const suffix of ['creds.yaml', 'collection.json', 'scope.yaml']) {
+    try { fs.unlinkSync(path.join(root, `${jobId}.${suffix}`)); } catch { /* already gone */ }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Providers — mirrors crates/harness/src/models.rs `providers()`. Kept as a
 // literal table (not parsed from CLI output) so `kind` ("cli" = usable via a
 // locally-installed agentic CLI subscription login, "api" = key-only) and
@@ -440,20 +569,17 @@ async function materializeScope(body, jobId) {
   if (!scope) return undefined;
   const hard = (Array.isArray(scope.hard) ? scope.hard : String(scope.hard || '').split(/[\n,;]+/)).map((x) => String(x).trim()).filter(Boolean);
   if (!hard.length) return undefined; // no boundary set — nothing to enforce beyond flags
-  const dir = path.join(os.tmpdir(), 'neurosploit-web');
-  await fsp.mkdir(dir, { recursive: true });
-  const file = path.join(dir, `${jobId}.scope.yaml`);
-  await fsp.writeFile(file, buildScopeYaml(scope));
+  const file = path.join(tempRoot(), `${jobId}.scope.yaml`);
+  await fsp.writeFile(file, buildScopeYaml(scope), { mode: 0o600 });
   return file;
 }
 
 async function materializeCreds(body, jobId) {
-  if (body.creds) return body.creds; // explicit file path on disk wins
+  // An explicit path wins, but only if it resolves inside an allowed root.
+  if (body.creds) return requireConfinedPath(String(body.creds), 'creds');
   if (!body.auth && !(body.roles || []).length) return undefined;
-  const dir = path.join(os.tmpdir(), 'neurosploit-web');
-  await fsp.mkdir(dir, { recursive: true });
-  const file = path.join(dir, `${jobId}.creds.yaml`);
-  await fsp.writeFile(file, buildCredsYaml(body));
+  const file = path.join(tempRoot(), `${jobId}.creds.yaml`);
+  await fsp.writeFile(file, buildCredsYaml(body), { mode: 0o600 });
   return file;
 }
 
@@ -462,12 +588,10 @@ async function materializeCreds(body, jobId) {
 // (collectionPath). Uploaded content is written to a temp file so the CLI's
 // --collection flag can read it.
 async function materializeCollection(body, jobId) {
-  if (body.collectionPath) return body.collectionPath; // path on disk wins
+  if (body.collectionPath) return requireConfinedPath(String(body.collectionPath), 'collectionPath');
   if (!body.collectionData) return undefined;
-  const dir = path.join(os.tmpdir(), 'neurosploit-web');
-  await fsp.mkdir(dir, { recursive: true });
-  const file = path.join(dir, `${jobId}.collection.json`);
-  await fsp.writeFile(file, body.collectionData);
+  const file = path.join(tempRoot(), `${jobId}.collection.json`);
+  await fsp.writeFile(file, body.collectionData, { mode: 0o600 });
   return file;
 }
 
@@ -1043,12 +1167,10 @@ async function runRegression(dir, id) {
 }
 
 function safeRunDir(id) {
-  if (!/^[a-zA-Z0-9_.-]+$/.test(id)) return null;
-  const dir = path.join(RUNS_DIR, id);
-  // Contain the delete to RUNS_DIR: reject anything that resolves out of it
-  // (defence in depth on top of the charset check, which already forbids `/`).
-  if (dir !== RUNS_DIR && !dir.startsWith(RUNS_DIR + path.sep)) return null;
-  return dir;
+  // One implementation: resolveRunDir() owns the id charset and the containment
+  // rule. Keeping a second copy here is how the two drift apart.
+  const r = resolveRunDir(id);
+  return r.ok ? r.value : null;
 }
 
 /// Permanently delete one run: its whole directory (findings, evidence, PoCs,
@@ -1228,20 +1350,41 @@ function ingestLine(job, rawLine) {
 
 function buildArgs(body) {
   const rawMode = body.mode || 'run';
+  if (!MODE_ALLOWLIST.has(rawMode)) {
+    throw badInput('mode', `unsupported mode ${JSON.stringify(String(rawMode))}`);
+  }
   const mode = rawMode === 'cloud' ? 'host' : rawMode;
   const args = [mode];
-  if (rawMode === 'cloud') {
-    args.push(body.target || 'localhost');
-    args.push('--cloud', body.target || 'aws');
-  } else if (mode === 'run' || mode === 'host' || mode === 'aitest') {
-    args.push(body.target);
-  } else if (mode === 'whitebox' || mode === 'skills') {
-    args.push(body.repo || body.target);
-  } else if (mode === 'greybox') {
-    args.push(body.repo);
-    args.push('--url', body.target);
+
+  // Free-text values become argv elements, so a leading '-' would turn one into
+  // a flag. Paths additionally have to resolve inside an allowed root.
+  const str = (v, f) => (v === undefined || v === null || v === '' ? undefined : requirePositional(String(v), f));
+  const target = str(body.target, 'target');
+  const repo = str(body.repo, 'repo');
+  const creds = body.creds ? requireConfinedPath(String(body.creds), 'creds') : undefined;
+  const collectionPath = body.collectionPath
+    ? requireConfinedPath(String(body.collectionPath), 'collectionPath') : undefined;
+  const scopePath = body.scopePath ? requireConfinedPath(String(body.scopePath), 'scopePath') : undefined;
+
+  const needTarget = ['run', 'host', 'aitest', 'greybox'];
+  if (needTarget.includes(mode) && !target) throw badInput('target', 'value is required');
+  if ((mode === 'whitebox' || mode === 'skills') && !(repo || target)) {
+    throw badInput('repo', 'value is required');
   }
-  for (const m of body.models || []) args.push('--model', m);
+  if (mode === 'greybox' && !repo) throw badInput('repo', 'value is required');
+
+  if (rawMode === 'cloud') {
+    args.push(target || 'localhost');
+    args.push('--cloud', target || 'aws');
+  } else if (mode === 'run' || mode === 'host' || mode === 'aitest') {
+    args.push(target);
+  } else if (mode === 'whitebox' || mode === 'skills') {
+    args.push(repo || target);
+  } else if (mode === 'greybox') {
+    args.push(repo);
+    args.push('--url', target);
+  }
+  for (const m of body.models || []) args.push('--model', requirePositional(String(m), 'models'));
   if (body.votes) args.push('--vote-n', String(body.votes));
   if (body.chainDepth !== undefined) args.push('--chain-depth', String(body.chainDepth));
   if (body.recon) args.push('--recon', String(body.recon));
@@ -1252,11 +1395,11 @@ function buildArgs(body) {
   if (body.offline) args.push('--offline');
   if (body.subscription) args.push('--subscription');
   if (body.mcp) args.push('--mcp');
-  if (body.creds) args.push('--creds', body.creds);
-  if (body.collectionPath) args.push('--collection', body.collectionPath);
-  if (body.focus) args.push('--focus', body.focus);
-  if (body.objective) args.push('--objective', body.objective);
-  if (body.outOfScope) args.push('--out-of-scope', body.outOfScope);
+  if (creds) args.push('--creds', creds);
+  if (collectionPath) args.push('--collection', collectionPath);
+  if (body.focus) args.push('--focus', requirePositional(String(body.focus), 'focus'));
+  if (body.objective) args.push('--objective', requirePositional(String(body.objective), 'objective'));
+  if (body.outOfScope) args.push('--out-of-scope', requirePositional(String(body.outOfScope), 'outOfScope'));
   // Budget: omitted entirely means the full run, exactly as before budgets
   // existed — the web console never caps a run the operator didn't cap.
   if (body.budget && body.budget !== 'unlimited') args.push('--budget', body.budget);
@@ -1266,23 +1409,23 @@ function buildArgs(body) {
   else if (body.order === 'coverage-first') args.push('--coverage-first');
   if (body.samplePerRoute) args.push('--sample-per-route', String(body.samplePerRoute));
   if (body.transport && body.transport !== 'direct') args.push('--transport', body.transport);
-  if (body.oobDomain) args.push('--oob-domain', body.oobDomain);
-  if (body.oobHttp) args.push('--oob-http', body.oobHttp);
-  if (body.oobDns) args.push('--oob-dns', body.oobDns);
-  if (body.sms) args.push('--sms', body.sms);
-  if (body.typesafe) args.push('--typesafe', body.typesafe);
-  if (body.intercept && body.intercept !== 'off') args.push('--intercept', body.intercept);
-  if (body.sandbox) args.push('--sandbox', body.sandbox === 'default' ? '' : body.sandbox);
+  if (body.oobDomain) args.push('--oob-domain', requirePositional(String(body.oobDomain), 'oobDomain'));
+  if (body.oobHttp) args.push('--oob-http', requirePositional(String(body.oobHttp), 'oobHttp'));
+  if (body.oobDns) args.push('--oob-dns', requirePositional(String(body.oobDns), 'oobDns'));
+  if (body.sms) args.push('--sms', requirePositional(String(body.sms), 'sms'));
+  if (body.typesafe) args.push('--typesafe', requirePositional(String(body.typesafe), 'typesafe'));
+  if (body.intercept && body.intercept !== 'off') args.push('--intercept', requirePositional(String(body.intercept), 'intercept'));
+  if (body.sandbox) args.push('--sandbox', body.sandbox === 'default' ? '' : requirePositional(String(body.sandbox), 'sandbox'));
   if (body.revalidatePoc) args.push('--revalidate-poc');
-  for (const fw of body.compliance || []) args.push('--compliance', fw);
+  for (const fw of body.compliance || []) args.push('--compliance', requirePositional(String(fw), 'compliance'));
   // Authorization: the signed grant caps the scope, the extra in-scope entries
   // can only narrow within it, and the environment scales every risk score.
-  for (const entry of body.inScope || []) args.push('--in-scope', entry);
-  if (body.scopePath) args.push('--scope-file', body.scopePath);
-  if (body.capability) args.push('--capability-token', body.capability);
-  if (body.environment) args.push('--environment', body.environment);
-  if (body.policyProfile) args.push('--policy', body.policyProfile);
-  for (const a of body.agents || []) args.push('--only', a);
+  for (const entry of body.inScope || []) args.push('--in-scope', requirePositional(String(entry), 'inScope'));
+  if (scopePath) args.push('--scope-file', scopePath);
+  if (body.capability) args.push('--capability-token', requirePositional(String(body.capability), 'capability'));
+  if (body.environment) args.push('--environment', requirePositional(String(body.environment), 'environment'));
+  if (body.policyProfile) args.push('--policy', requirePositional(String(body.policyProfile), 'policyProfile'));
+  for (const a of body.agents || []) args.push('--only', requirePositional(String(a), 'agents'));
   args.push('--verbose');
   return args;
 }
@@ -1343,7 +1486,7 @@ async function startJob(body) {
 // their defaults. Keep this list to the `global = true` args in app/src/main.rs.
 function authArgs(body) {
   const args = [];
-  if (body.capability) args.push('--capability-token', body.capability);
+  if (body.capability) args.push('--capability-token', requirePositional(String(body.capability), 'capability'));
   for (const entry of body.inScope || []) args.push('--session-in-scope', entry);
   if (body.environment) args.push('--session-environment', body.environment);
   if (body.policyProfile) args.push('--session-policy', body.policyProfile);
@@ -1389,36 +1532,51 @@ function sanitizeLaunch(body) {
 }
 
 function buildReplScript(body) {
+  // Every value below is interpolated into a `/command` line, so each one is
+  // checked for control characters and for a leading REPL command word; the two
+  // path fields are additionally confined to an allowed root.
   const lines = [];
-  if (body.mode === 'whitebox') lines.push(`/repo ${body.repo || body.target}`);
+  const target = body.target ? requireReplValue(String(body.target), 'target') : undefined;
+  const repo = body.repo ? requireReplValue(String(body.repo), 'repo') : undefined;
+  const creds = body.creds
+    ? requireConfinedPath(requireReplValue(String(body.creds), 'creds'), 'creds') : undefined;
+  const collectionPath = body.collectionPath
+    ? requireConfinedPath(requireReplValue(String(body.collectionPath), 'collectionPath'), 'collectionPath')
+    : undefined;
+  if (body.mode === 'whitebox') lines.push(`/repo ${repo || target}`);
   else {
-    if (body.target) lines.push(`/target ${body.target}`);
-    if (body.mode === 'greybox' && body.repo) lines.push(`/repo ${body.repo}`);
+    if (target) lines.push(`/target ${target}`);
+    if (body.mode === 'greybox' && repo) lines.push(`/repo ${repo}`);
   }
-  if ((body.models || []).length) lines.push(`/model ${body.models.join(',')}`);
+  if ((body.models || []).length) lines.push(`/model ${body.models.map((m) => requireReplValue(String(m), 'models')).join(',')}`);
   lines.push(`/sub ${body.subscription ? 'on' : 'off'}`);
   lines.push(`/mcp ${body.mcp ? 'on' : 'off'}`);
   if (body.votes) lines.push(`/votes ${body.votes}`);
   if (body.chainDepth !== undefined) lines.push(`/chain ${body.chainDepth}`);
   if (body.recon) lines.push(`/recon ${body.recon}`);
   if (body.maxAgents) lines.push(`/agents ${body.maxAgents}`);
-  if (body.focus) lines.push(`/focus ${body.focus}`);
-  if (body.objective) lines.push(`/objective ${body.objective}`);
-  if (body.outOfScope) lines.push(`/scope-out ${body.outOfScope}`);
-  if (body.creds) lines.push(`/creds ${body.creds}`);
-  if (body.collectionPath) lines.push(`/collection ${body.collectionPath}`);
+  if (body.focus) lines.push(`/focus ${requireReplValue(String(body.focus), 'focus')}`);
+  if (body.objective) lines.push(`/objective ${requireReplValue(String(body.objective), 'objective')}`);
+  if (body.outOfScope) lines.push(`/scope-out ${requireReplValue(String(body.outOfScope), 'outOfScope')}`);
+  if (creds) lines.push(`/creds ${creds}`);
+  if (collectionPath) lines.push(`/collection ${collectionPath}`);
   if (body.research) lines.push(`/research on`);
   // Settings the wizard collects that are NOT already applied as launch flags
   // (authArgs) or the scope file. Emitted via the REPL's own commands so a web
   // run enforces exactly what a typed session would. Capability, in-scope,
   // intercept, sandbox, OOB, environment, policy and the scope allowlist are
   // handled at launch in authArgs()/materializeScope() — do not re-emit them here.
-  if (body.classes) lines.push(`/class ${Array.isArray(body.classes) ? body.classes.join(',') : body.classes}`);
+  if (body.classes) {
+    const cls = Array.isArray(body.classes) ? body.classes : [body.classes];
+    lines.push(`/class ${cls.map((c) => requireReplValue(String(c), 'classes')).join(',')}`);
+  }
   if (body.revalidatePoc) lines.push('/revalidate on');
   if (body.budget && body.budget !== 'unlimited') lines.push(`/budget ${body.budget}`);
   if (body.tokenLimit) lines.push(`/budget token ${body.tokenLimit}`);
-  for (const fw of body.compliance || []) lines.push(`/compliance ${fw}`);
-  lines.push((body.agents || []).length ? `/only ${body.agents.join(',')}` : '/only clear');
+  for (const fw of body.compliance || []) lines.push(`/compliance ${requireReplValue(String(fw), 'compliance')}`);
+  lines.push((body.agents || []).length
+    ? `/only ${body.agents.map((a) => requireReplValue(String(a), 'agents')).join(',')}`
+    : '/only clear');
   // Economy preset last, so it wins over the per-knob settings above.
   if (body.quick) lines.push('/quick');
   lines.push('/run');
@@ -2318,7 +2476,12 @@ async function startServer({ port = PORT, host = HOST } = {}) {
   return listening;
 }
 
-module.exports = { startServer, bindAddress, bindBanner, isLoopback, metaPayload };
+module.exports = {
+  startServer, bindAddress, bindBanner, isLoopback, metaPayload,
+  buildArgs, buildReplScript, authArgs,
+  MODE_ALLOWLIST, checkPositional, safeReplValue, confinePath, resolveRunDir,
+  materializeCreds, cleanupJobTemp,
+};
 
 if (require.main === module) {
   startServer().catch((err) => {
