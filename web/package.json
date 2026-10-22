@@ -5,7 +5,8 @@
   "description": "NeuroSploit v4.4.0 web console — lead board + REPL, backed by the neurosploit CLI harness.",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=18"

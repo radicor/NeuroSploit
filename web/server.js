@@ -121,6 +121,38 @@ function binaryVersion() {
 const VERSION = binaryVersion();
 
 const PORT = Number(process.env.NEUROSPLOIT_WEB_PORT || process.env.PORT || 4173);
+// Loopback by default: this process can drive the harness, so binding every
+// interface puts remote control of an engagement on the LAN. Deliberate remote
+// access stays possible via NEUROSPLOIT_WEB_BIND, but it warns.
+const HOST = process.env.NEUROSPLOIT_WEB_BIND || '127.0.0.1';
+
+/// Host string for a URL: IPv6 literals need brackets, everything else is used
+/// as given. Display only — `server.listen` gets the raw host.
+function bindAddress(host) {
+  const h = String(host || '127.0.0.1');
+  return h.includes(':') && !h.startsWith('[') ? `[${h}]` : h;
+}
+
+function bindBanner(host, port) {
+  return `http://${bindAddress(host)}:${port}`;
+}
+
+/// 127.0.0.0/8 and ::1 (including v4-mapped forms) are local. Comparing against
+/// the literal "127.0.0.1" would treat 127.0.0.2 as remote.
+function isLoopback(addr) {
+  if (!addr) return false;
+  const a = String(addr).replace(/^::ffff:/i, '');
+  if (a === '::1') return true;
+  const m = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(a);
+  return Boolean(m) && m.slice(1).every((o) => Number(o) <= 255);
+}
+
+/// /api/meta body. Absolute paths describe the operator's filesystem, so they
+/// go only to a loopback peer; a remote caller gets the version alone.
+function metaPayload(remoteAddress) {
+  if (isLoopback(remoteAddress)) return { version: VERSION, binary: BIN, root: ROOT };
+  return { version: VERSION };
+}
 
 // ---------------------------------------------------------------------------
 // Providers — mirrors crates/harness/src/models.rs `providers()`. Kept as a
@@ -2078,7 +2110,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && p === '/api/meta') {
-      return sendJson(res, 200, { version: VERSION, binary: BIN, root: ROOT });
+      return sendJson(res, 200, metaPayload(req.socket.remoteAddress));
     }
 
     // ---- providers / API keys (in-memory only, never persisted) ----
@@ -2237,11 +2269,60 @@ const server = http.createServer(async (req, res) => {
 
 loadPersistedJobs();
 
-server.listen(PORT, () => {
-  console.log(`NeuroSploit v${VERSION} web console → http://localhost:${PORT}`);
+let listening = null; // the bound listener description, once startServer resolves
+
+/// Start the console and resolve once the port is bound. Idempotent per
+/// process: a second call returns the running listener rather than opening a
+/// second one, so tests and callers can share it.
+async function startServer({ port = PORT, host = HOST } = {}) {
+  if (listening) return listening;
+
+  await new Promise((resolve, reject) => {
+    const onError = (err) => { server.removeListener('error', onError); reject(err); };
+    server.once('error', onError);
+    server.listen(port, host, () => { server.removeListener('error', onError); resolve(); });
+  });
+
+  // server.address() is the source of truth: `port: 0` asks the OS for one, and
+  // the configured host is not what was necessarily bound.
+  const addr = server.address();
+  const boundPort = addr.port;
+  const boundHost = addr.address;
+  const url = bindBanner(boundHost, boundPort);
+
+  console.log(`NeuroSploit v${VERSION} web console → ${url}`);
   console.log(`  binary : ${BIN || '(not found — build neurosploit-rs first)'}`);
   console.log(`  agents : ${AGENTS_DIR}`);
   console.log(`  runs   : ${RUNS_DIR}`);
   const resumable = [...jobs.values()].filter((j) => j.interrupted && j.resumable).length;
   if (resumable) console.log(`  jobs   : ${resumable} interrupted run(s) can be resumed`);
-});
+
+  if (!isLoopback(boundHost)) {
+    const auth = process.env.NEUROSPLOIT_WEB_AUTH || 'none';
+    console.log(`WARNING: console bound to ${boundHost} — reachable from the network, not just this host.`);
+    console.log(`         authentication is "${auth}"; set NEUROSPLOIT_WEB_AUTH=token before exposing this port.`);
+  }
+
+  listening = {
+    url,
+    host: boundHost,
+    port: boundPort,
+    address: () => server.address(),
+    close: () => new Promise((resolve, reject) => {
+      listening = null;
+      // close() waits on keep-alive sockets; drop them so tests do not hang.
+      server.closeAllConnections?.();
+      server.close((err) => (err ? reject(err) : resolve()));
+    }),
+  };
+  return listening;
+}
+
+module.exports = { startServer, bindAddress, bindBanner, isLoopback, metaPayload };
+
+if (require.main === module) {
+  startServer().catch((err) => {
+    console.error(`failed to start the console on ${HOST}:${PORT}: ${err.message}`);
+    process.exitCode = 1;
+  });
+}
