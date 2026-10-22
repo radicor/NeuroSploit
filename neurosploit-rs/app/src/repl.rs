@@ -2101,7 +2101,7 @@ async fn start_background(base: &Path, s: &Session, reader: &mut Reader,
             let mut h = hist2.lock().unwrap();
             let id = h.len() + 1;
             h.push(RunRecord { id, mode: mode_s.into(), target, workdir: workdir.display().to_string(), findings: findings.clone() });
-            if let Ok(j) = serde_json::to_string_pretty(&*h) { std::fs::write(proj_dir().join("runs.json"), j).ok(); }
+            if let Ok(j) = serde_json::to_string_pretty(&*h) { harness::state::write_atomic(&proj_dir().join("runs.json"), j.as_bytes()).ok(); }
             id
         };
         clear_checkpoint(); // run is now a completed RunRecord
@@ -2320,13 +2320,13 @@ fn load_runs(_base: &Path) -> Vec<RunRecord> {
 }
 fn save_runs(_base: &Path, history: &[RunRecord]) {
     let p = runs_path(_base);
-    if let Ok(j) = serde_json::to_string_pretty(history) { std::fs::write(p, j).ok(); }
+    if let Ok(j) = serde_json::to_string_pretty(history) { harness::state::write_atomic(&p, j.as_bytes()).ok(); }
 }
 
 /// Live-run checkpoint file (one in-flight run at a time).
 fn checkpoint_path() -> std::path::PathBuf { proj_dir().join("active_run.json") }
 fn save_checkpoint(c: &LiveCheckpoint) {
-    if let Ok(j) = serde_json::to_string_pretty(c) { std::fs::write(checkpoint_path(), j).ok(); }
+    if let Ok(j) = serde_json::to_string_pretty(c) { harness::state::write_atomic(&checkpoint_path(), j.as_bytes()).ok(); }
 }
 fn clear_checkpoint() { std::fs::remove_file(checkpoint_path()).ok(); }
 fn load_checkpoint() -> Option<LiveCheckpoint> {
@@ -2377,7 +2377,7 @@ fn save_session(s: &Session) {
         scope_observe: s.policy.soft.observe_only.iter().map(|p| p.as_text()).collect(),
         soft: Some(s.policy.soft.clone()),
     };
-    if let Ok(j) = serde_json::to_string_pretty(&snap) { std::fs::write(session_path(), j).ok(); }
+    if let Ok(j) = serde_json::to_string_pretty(&snap) { harness::state::write_atomic(&session_path(), j.as_bytes()).ok(); }
 }
 fn load_session(s: &mut Session) -> bool {
     let Ok(txt) = std::fs::read_to_string(session_path()) else { return false };

@@ -60,17 +60,54 @@ function saveEngagementName(runId, name) {
 const CONFIG_DIR = path.join(ROOT, '.neurosploit');
 function configFile(name) { return path.join(CONFIG_DIR, `${name}.json`); }
 async function ensureConfigDir() { await fsp.mkdir(CONFIG_DIR, { recursive: true }); }
+// Atomic state write (SEC-014): temp file, fsync, rotate the old file to .bak,
+// then rename in. Sync, so a caller inside a request handler cannot interleave
+// with another save and leave a half-written config.
+let TMP_COUNTER = 0;
+function atomicWriteSync(p, data) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const tmp = `${p}.tmp-${process.pid}-${++TMP_COUNTER}`;
+  try {
+    const fd = fs.openSync(tmp, 'w');
+    try { fs.writeFileSync(fd, data); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    if (fs.existsSync(p)) {
+      const bak = `${p}.bak`;
+      try { fs.rmSync(bak, { force: true }); } catch { /* first rotation */ }
+      fs.renameSync(p, bak);
+    }
+    fs.renameSync(tmp, p);
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* nothing to clean */ }
+    throw e;
+  }
+}
+
+// Tolerant load (SEC-014): missing -> fallback; valid -> parsed; truncated with a
+// good .bak -> the .bak value; both bad -> preserve a copy and use the fallback.
+function readJson(p, fallback) {
+  let raw;
+  try { raw = fs.readFileSync(p, 'utf8'); } catch { return fallback; }
+  try { return JSON.parse(raw); } catch { /* fall through to recovery */ }
+  try {
+    const recovered = JSON.parse(fs.readFileSync(`${p}.bak`, 'utf8'));
+    console.warn(`warning: ${p} was unreadable; recovered from .bak`);
+    return recovered;
+  } catch { /* both unreadable */ }
+  const q = `${p}.corrupt-${Date.now()}`;
+  try { fs.copyFileSync(p, q); } catch { /* nothing to preserve */ }
+  console.error(`warning: ${p} is corrupt and its backup is unusable; preserved as ${q}`);
+  return fallback;
+}
+
 async function readConfig(name) {
-  try { return JSON.parse(await fsp.readFile(configFile(name), 'utf8')); }
-  catch { return []; }
+  return readJson(configFile(name), []);
 }
 async function readConfigObj(name) {
-  try { return JSON.parse(await fsp.readFile(configFile(name), 'utf8')); }
-  catch { return {}; }
+  return readJson(configFile(name), {});
 }
 async function writeConfig(name, data) {
   await ensureConfigDir();
-  await fsp.writeFile(configFile(name), JSON.stringify(data, null, 2));
+  atomicWriteSync(configFile(name), JSON.stringify(data, null, 2));
 }
 
 const JOBS_DIR = path.join(ROOT, '.neurosploit', 'web-jobs');
@@ -86,7 +123,7 @@ function persistJob(job) {
       feedTail: job.feed.slice(-300),      // enough to repaint the live log
       savedAt: Date.now(),
     };
-    fs.writeFileSync(jobFile(job.id), JSON.stringify(rec));
+    atomicWriteSync(jobFile(job.id), JSON.stringify(rec));
   } catch { /* best-effort — persistence never breaks a run */ }
 }
 function deleteJobFile(id) { try { fs.unlinkSync(jobFile(id)); } catch { /* gone already */ } }
@@ -2588,6 +2625,7 @@ module.exports = {
   buildArgs, buildReplScript, authArgs,
   MODE_ALLOWLIST, checkPositional, safeReplValue, confinePath, resolveRunDir,
   isPrivateAddress, integrationUrlAllowed, validateIntegration, assetHeaders, newConfigItem,
+  atomicWriteSync, readJson, writeConfig, readConfig,
   materializeCreds, cleanupJobTemp,
 };
 

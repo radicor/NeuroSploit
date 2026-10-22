@@ -53,6 +53,7 @@ pub mod rl;
 pub mod sandbox;
 pub mod sarif;
 pub mod scope;
+pub mod state;
 pub mod taint;
 pub mod traces;
 pub mod transport;
