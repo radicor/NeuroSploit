@@ -1960,7 +1960,7 @@ function readBody(req) {
     req.on('data', (c) => { data += c; if (data.length > 5_000_000) req.destroy(); });
     req.on('end', () => {
       if (!data) return resolve({});
-      try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+      try { resolve(JSON.parse(data)); } catch { reject(badInput('body', 'malformed JSON')); }
     });
     req.on('error', reject);
   });
@@ -2036,6 +2036,116 @@ async function serveRunAsset(req, res, id, rest) {
     res.writeHead(404);
     res.end('not found');
   }
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency, per-name config locks and finished-job pruning (SEC-007c).
+// ---------------------------------------------------------------------------
+const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
+const idempotencyStore = new Map();
+
+function idempotencyKey(req) {
+  const raw = req && req.headers && req.headers['idempotency-key'];
+  if (!raw) return null;
+  const k = String(raw).trim();
+  if (k.length < 8 || k.length > 128) return null;
+  return k;
+}
+
+// Key order in JSON is not semantic, so the digest must sort at every level or
+// the same request looks different and the dedupe it exists for never fires.
+function canonicalJson(v) {
+  if (Array.isArray(v)) return v.map(canonicalJson);
+  if (v && typeof v === 'object') {
+    const out = {};
+    for (const k of Object.keys(v).sort()) out[k] = canonicalJson(v[k]);
+    return out;
+  }
+  return v;
+}
+
+function bodyDigest(body) {
+  return crypto.createHash('sha256').update(JSON.stringify(canonicalJson(body || {}))).digest('hex');
+}
+
+function sweepIdempotency(now) {
+  for (const [k, v] of idempotencyStore) {
+    if (now - v.at > IDEMPOTENCY_TTL_MS) idempotencyStore.delete(k);
+  }
+}
+
+// Replays the stored response for a repeated key. A different body under the
+// same key is a 422 and must NOT execute: returning the first response to a
+// different request hides that the caller asked for something else.
+async function withIdempotency(key, digest, fn, opts = {}) {
+  const now = opts.now || Date.now();
+  if (!key) return { ok: true, response: await fn() };
+  sweepIdempotency(now);
+  const hit = idempotencyStore.get(key);
+  if (hit) {
+    if (hit.digest !== digest) {
+      return { ok: false, status: 422, error: 'Idempotency-Key was reused with a different body' };
+    }
+    return { ok: true, response: hit.response, replayed: true };
+  }
+  const response = await fn();
+  // Only a success is worth replaying; a 409/4xx is a state observation.
+  if (!response || response.status === 200) {
+    idempotencyStore.set(key, { digest, response, at: now });
+  }
+  return { ok: true, response };
+}
+
+// Returns the id of a RUNNING job with the same shape. A finished job does not
+// count — retesting the same target is normal.
+function duplicateLaunch(mode, target, opts = {}) {
+  const jobMap = opts.jobMap || jobs;
+  const wantMode = mode || 'run';
+  const wantTarget = target || '';
+  for (const job of jobMap.values()) {
+    if (!job || job.done) continue;
+    const launch = job.launch || {};
+    if ((launch.mode || 'run') === wantMode && (launch.target || '') === wantTarget) return job.id;
+  }
+  return null;
+}
+
+// Read-modify-write under the name's lock: the read is inside the critical
+// section, or two concurrent adds still drop one write.
+async function mutateConfig(name, fn) {
+  return withConfigLock(name, async () => {
+    const list = await readConfig(name);
+    const next = await fn(list);
+    await writeConfig(name, next);
+    return next;
+  });
+}
+
+// Per-name promise chain. A throwing body must release the lock, so the chain
+// absorbs the rejection before the next caller chains onto it.
+const configLocks = new Map();
+function withConfigLock(name, fn) {
+  const prev = configLocks.get(name) || Promise.resolve();
+  const run = prev.catch(() => {}).then(() => fn());
+  configLocks.set(name, run.then(() => {}, () => {}));
+  return run;
+}
+
+// Evicts finished jobs only. A job with no finish timestamp is never evicted:
+// pruning must not kill work in flight.
+function pruneJobs(maxAgeMs, opts = {}) {
+  const now = opts.now || Date.now();
+  const jobMap = opts.jobMap || jobs;
+  let n = 0;
+  for (const [id, job] of jobMap) {
+    if (!job || !job.done) continue;
+    const finishedAt = job.finishedAt || job.endedAt || job.doneAt || 0;
+    if (!finishedAt || now - finishedAt < maxAgeMs) continue;
+    jobMap.delete(id);
+    deleteJobFile(id);
+    n += 1;
+  }
+  return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -2494,13 +2604,24 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && p === '/api/exploit') {
       const body = await readBody(req);
-      // run/whitebox/greybox go through a real REPL session so the operator
-      // can keep sending it input while it streams; host/aitest/skills need
-      // the onboarding scope picker (an interactive menu that only works on
-      // a real TTY), so they stay on the plain one-shot CLI subprocess.
-      const replCapable = ['run', 'whitebox', 'greybox'].includes(body.mode || 'run');
-      const job = replCapable ? await startJobViaRepl(body) : await startJob(body);
-      return sendJson(res, 200, { id: job.id, interactive: !!job.repl });
+      const key = idempotencyKey(req);
+      const idem = await withIdempotency(key, bodyDigest(body), async () => {
+        // Without a key, a second launch of the same target is a mistake worth
+        // reporting rather than a second engagement.
+        if (!key) {
+          const dup = duplicateLaunch(body.mode || 'run', body.target || '');
+          if (dup) return { status: 409, body: { error: 'already running', id: dup } };
+        }
+        // run/whitebox/greybox go through a real REPL session so the operator
+        // can keep sending it input while it streams; host/aitest/skills need
+        // the onboarding scope picker (an interactive menu that only works on
+        // a real TTY), so they stay on the plain one-shot CLI subprocess.
+        const replCapable = ['run', 'whitebox', 'greybox'].includes(body.mode || 'run');
+        const job = replCapable ? await startJobViaRepl(body) : await startJob(body);
+        return { status: 200, body: { id: job.id, interactive: !!job.repl } };
+      });
+      if (!idem.ok) return sendJson(res, idem.status, { error: idem.error });
+      return sendJson(res, idem.response.status, idem.response.body);
     }
     m = p.match(/^\/api\/exploit\/([^/]+)$/);
     if (req.method === 'GET' && m) {
@@ -2835,10 +2956,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && p === '/api/config/repos') return sendJson(res, 200, await readConfig('repos'));
     if (req.method === 'POST' && p === '/api/config/repos') {
       const body = await readBody(req);
-      const repos = await readConfig('repos');
       const item = newConfigItem(body);
-      repos.push(item);
-      await writeConfig('repos', repos);
+      await mutateConfig('repos', (list) => [...list, item]);
       return sendJson(res, 200, item);
     }
     m = p.match(/^\/api\/config\/repos\/([^/]+)$/);
@@ -2853,10 +2972,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && p === '/api/config/domains') return sendJson(res, 200, await readConfig('domains'));
     if (req.method === 'POST' && p === '/api/config/domains') {
       const body = await readBody(req);
-      const domains = await readConfig('domains');
       const item = newConfigItem(body);
-      domains.push(item);
-      await writeConfig('domains', domains);
+      await mutateConfig('domains', (list) => [...list, item]);
       return sendJson(res, 200, item);
     }
     m = p.match(/^\/api\/config\/domains\/([^/]+)$/);
@@ -2871,10 +2988,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && p === '/api/config/networks') return sendJson(res, 200, await readConfig('networks'));
     if (req.method === 'POST' && p === '/api/config/networks') {
       const body = await readBody(req);
-      const networks = await readConfig('networks');
       const item = newConfigItem(body);
-      networks.push(item);
-      await writeConfig('networks', networks);
+      await mutateConfig('networks', (list) => [...list, item]);
       return sendJson(res, 200, item);
     }
     m = p.match(/^\/api\/config\/networks\/([^/]+)$/);
@@ -2992,6 +3107,10 @@ async function startServer({ port = PORT, host = HOST } = {}) {
     console.log('WARNING: console authentication is disabled — any local process or page can drive the harness.');
     console.log('         set NEUROSPLOIT_WEB_AUTH=token to require a login token (v4.6 defaults to token).');
   } else {
+    // Mint the token at startup, not on the first comparison: otherwise a fresh
+    // token-mode install prints no one-time login URL and the operator has no
+    // way in.
+    rootToken();
     console.log(`  auth   : token — log in with the token in ${TOKEN_FILE}`);
   }
 
@@ -3024,6 +3143,7 @@ module.exports = {
   atomicWriteSync, readJson, writeConfig, readConfig,
   authMode, checkAuth, issueSession,
   securityHeaders, hostAllowed, originAllowed, enforceJsonType, rateLimit,
+  idempotencyKey, bodyDigest, withIdempotency, duplicateLaunch, withConfigLock, pruneJobs, mutateConfig,
   tierFor, tierRuleFor, redactSecret, redactEntry, isMasked, unmaskOnWrite, requireConfirm, redactIntegration, redactVault, unmaskVault,
   materializeCreds, cleanupJobTemp,
 };

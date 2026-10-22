@@ -2,11 +2,11 @@
   "name": "neurosploit-web",
   "version": "4.4.0",
   "private": true,
-  "description": "NeuroSploit v4.4.0 web console — lead board + REPL, backed by the neurosploit CLI harness.",
+  "description": "NeuroSploit v4.4.0 web console \u2014 lead board + REPL, backed by the neurosploit CLI harness.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test --test-concurrency=1 test/*.test.js"
   },
   "engines": {
     "node": ">=18"

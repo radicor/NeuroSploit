@@ -228,14 +228,16 @@ test('the SPA bootstrap is wired and /api/auth/status answers (c12)', async () =
   } finally { await srv.close(); setMode(undefined); }
 });
 
-test('a 500 does not leak a stack (c13)', async () => {
+test('a malformed body is a 400 and leaks no stack (c13)', async () => {
   setMode(undefined);
   const srv = await startServer({ port: 0 });
   try {
     const res = await fetch(`${srv.url}/api/config/vault`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: '{not json',
     });
-    assert.strictEqual(res.status, 500, 'a malformed body currently surfaces as a server error');
+    // SEC-007c c12 changed this from 500 to 400; the no-stack property below is
+    // what this test exists for, and it runs through the same shared catch.
+    assert.strictEqual(res.status, 400, 'malformed JSON is the client\'s fault');
     const body = await res.json();
     assert.ok(body.error, 'the client gets a message');
     assert.ok(!('stack' in body), 'no stack may be returned');
