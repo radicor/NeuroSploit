@@ -2020,6 +2020,87 @@ async function serveRunAsset(req, res, id, rest) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Console authentication (SEC-005). The bridge release: the default mode is
+// `none` with a loud warning, and the `token` path ships fully so v4.6 can flip
+// the default without shipping new code.
+// ---------------------------------------------------------------------------
+const TOKEN_FILE = path.join(CONFIG_DIR, 'console-token');
+const SESSIONS_FILE = path.join(CONFIG_DIR, 'console-sessions.json');
+const sha256hex = (v) => crypto.createHash('sha256').update(String(v)).digest('hex');
+
+function authMode() {
+  const raw = (process.env.NEUROSPLOIT_WEB_AUTH || 'none').trim().toLowerCase();
+  if (raw === 'token') return 'token';
+  if (raw !== 'none') console.warn(`warning: unknown NEUROSPLOIT_WEB_AUTH "${raw}"; using "none"`);
+  return 'none';
+}
+
+let ROOT_TOKEN = null;
+function rootToken() {
+  if (ROOT_TOKEN) return ROOT_TOKEN;
+  try {
+    const t = fs.readFileSync(TOKEN_FILE, 'utf8').trim();
+    if (t) { ROOT_TOKEN = t; return t; }
+  } catch { /* create one below */ }
+  const t = crypto.randomBytes(32).toString('base64url');
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(TOKEN_FILE, t, { mode: 0o600 });
+  try { fs.chmodSync(TOKEN_FILE, 0o600); } catch { /* best effort */ }
+  console.log(`console root token created at ${TOKEN_FILE}`);
+  console.log(`  one-time login: http://127.0.0.1:${PORT}/?token=${t}`);
+  ROOT_TOKEN = t;
+  return t;
+}
+
+function loadSessions() {
+  const v = readJson(SESSIONS_FILE, []);
+  return Array.isArray(v) ? v : [];
+}
+function saveSessions(list) { atomicWriteSync(SESSIONS_FILE, JSON.stringify(list)); }
+
+// Only the hash is persisted: a leaked sessions file must not yield a usable
+// cookie.
+function issueSession({ secure = false } = {}) {
+  const id = crypto.randomBytes(32).toString('base64url');
+  const list = loadSessions();
+  list.push({ h: sha256hex(id), at: Date.now() });
+  saveSessions(list);
+  const parts = [`ns_session=${id}`, 'HttpOnly', 'Path=/', 'SameSite=Strict', 'Max-Age=2592000'];
+  if (secure) parts.push('Secure');
+  return { id, cookie: parts.join('; ') };
+}
+
+function safeEqual(a, b) {
+  const A = Buffer.from(String(a));
+  const B = Buffer.from(String(b));
+  // timingSafeEqual throws on a length mismatch, so check first — a short token
+  // must be a 401, not a 500.
+  if (A.length !== B.length) return false;
+  try { return crypto.timingSafeEqual(A, B); } catch { return false; }
+}
+
+function cookieValue(req, name) {
+  const raw = req.headers && req.headers.cookie;
+  if (!raw) return null;
+  for (const part of String(raw).split(';')) {
+    const i = part.indexOf('=');
+    if (i < 0) continue;
+    if (part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return null;
+}
+
+function checkAuth(req, opts = {}) {
+  const mode = opts.mode || authMode();
+  if (mode === 'none') return { ok: true, via: 'none' };
+  const m = /^Bearer\s+(.+)$/i.exec((req.headers && req.headers.authorization) || '');
+  if (m && safeEqual(m[1].trim(), rootToken())) return { ok: true, via: 'bearer' };
+  const sid = cookieValue(req, 'ns_session');
+  if (sid && loadSessions().some((e) => e && e.h === sha256hex(sid))) return { ok: true, via: 'cookie' };
+  return { ok: false };
+}
+
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://localhost');
   const p = u.pathname;
@@ -2028,6 +2109,39 @@ const server = http.createServer(async (req, res) => {
     // ---- static ----
     if (req.method === 'GET' && !p.startsWith('/api/')) {
       return serveStatic(req, res, p);
+    }
+
+    // ---- auth gate (SEC-005): static is public, /api/* is not ----
+    if (p.startsWith('/api/')
+        && authMode() !== 'none'
+        && p !== '/api/auth/status'
+        && p !== '/api/auth/login') {
+      if (!checkAuth(req).ok) return sendJson(res, 401, { error: 'authentication required' });
+    }
+
+    // ---- auth endpoints ----
+    if (req.method === 'GET' && p === '/api/auth/status') {
+      return sendJson(res, 200, { auth: authMode(), authenticated: checkAuth(req).ok });
+    }
+    if (req.method === 'POST' && p === '/api/auth/login') {
+      const body = await readBody(req).catch(() => ({}));
+      if (!safeEqual(String(body.token || ''), rootToken())) {
+        return sendJson(res, 401, { error: 'invalid token' });
+      }
+      const { cookie } = issueSession({ secure: false });
+      res.setHeader('Set-Cookie', cookie);
+      return sendJson(res, 200, { ok: true });
+    }
+    if (req.method === 'POST' && p === '/api/auth/rotate') {
+      if (!checkAuth(req).ok) return sendJson(res, 401, { error: 'authentication required' });
+      const body = await readBody(req).catch(() => ({}));
+      ROOT_TOKEN = null;
+      try { fs.rmSync(TOKEN_FILE, { force: true }); } catch { /* absent */ }
+      const fresh = rootToken();
+      if (body && body.revokeSessions) saveSessions([]);
+      console.log(`console root token rotated (new token printed above)`);
+      void fresh;
+      return sendJson(res, 200, { ok: true });
     }
 
     // ---- agents / lead board ----
@@ -2565,7 +2679,13 @@ const server = http.createServer(async (req, res) => {
 
     sendJson(res, 404, { error: 'not found' });
   } catch (err) {
-    sendJson(res, 500, { error: err.message });
+    // A validator's 400 must reach the client as a 400 naming the field.
+    // Flattening every error to 500 is what made SEC-002's contract untestable
+    // over HTTP until now.
+    const status = Number(err && err.status) || 500;
+    const payload = { error: err && err.message };
+    if (err && err.field) payload.field = err.field;
+    sendJson(res, status, payload);
   }
 });
 
@@ -2599,6 +2719,15 @@ async function startServer({ port = PORT, host = HOST } = {}) {
   const resumable = [...jobs.values()].filter((j) => j.interrupted && j.resumable).length;
   if (resumable) console.log(`  jobs   : ${resumable} interrupted run(s) can be resumed`);
 
+  // The bridge default is loud on purpose: an unauthenticated console can drive
+  // the harness, and v4.6 flips the default to token.
+  if (authMode() === 'none') {
+    console.log('WARNING: console authentication is disabled — any local process or page can drive the harness.');
+    console.log('         set NEUROSPLOIT_WEB_AUTH=token to require a login token (v4.6 defaults to token).');
+  } else {
+    console.log(`  auth   : token — log in with the token in ${TOKEN_FILE}`);
+  }
+
   if (!isLoopback(boundHost)) {
     const auth = process.env.NEUROSPLOIT_WEB_AUTH || 'none';
     console.log(`WARNING: console bound to ${boundHost} — reachable from the network, not just this host.`);
@@ -2626,6 +2755,7 @@ module.exports = {
   MODE_ALLOWLIST, checkPositional, safeReplValue, confinePath, resolveRunDir,
   isPrivateAddress, integrationUrlAllowed, validateIntegration, assetHeaders, newConfigItem,
   atomicWriteSync, readJson, writeConfig, readConfig,
+  authMode, checkAuth, issueSession,
   materializeCreds, cleanupJobTemp,
 };
 
