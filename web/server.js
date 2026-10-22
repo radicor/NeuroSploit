@@ -393,6 +393,7 @@ async function integrationUrlAllowed(provider, rawUrl, { resolve } = {}) {
   if (!hostInList(host, (INTEGRATION_HOSTS[provider] || []).concat(extra))) {
     return { ok: false, error: `host ${host} is not allowed for ${provider}` };
   }
+  let pinned = literal ? host : null;
   if (!literal) {
     const lookup = resolve || ((h) => require('node:dns').promises.lookup(h, { all: true }));
     let addrs;
@@ -402,9 +403,12 @@ async function integrationUrlAllowed(provider, rawUrl, { resolve } = {}) {
     for (const a of list) {
       const ip = typeof a === 'string' ? a : a && a.address;
       if (isPrivateAddress(ip)) return { ok: false, error: `${host} resolves to a private address` };
+      if (!pinned) pinned = ip;
     }
   }
-  return { ok: true, value: u.origin };
+  // `address` is the one the caller must connect to: the gate resolved once, and
+  // a second resolution is exactly the rebinding window.
+  return { ok: true, value: u.origin, address: pinned };
 }
 
 // ---------------------------------------------------------------------------
@@ -536,20 +540,30 @@ async function cloudEnvOverrides(cloudProvider) {
   return env;
 }
 
-async function validateIntegration(id, cfg) {
+async function validateIntegration(id, cfg, options = {}) {
   const https = require('https');
   const http = require('http');
-  const fetch = (url, opts = {}) => new Promise((resolve, reject) => {
+  const net = require('net');
+  // `httpGet` is injectable so a test can prove NO request is made when the URL
+  // policy refuses; `address` pins the connection to the address the policy
+  // vetted, so a second resolution cannot redirect it.
+  const fetch = options.httpGet || ((url, opts = {}) => new Promise((resolve, reject) => {
     const mod = url.startsWith('https') ? https : http;
-    const req = mod.request(url, { method: 'GET', timeout: 8000, ...opts }, (res) => {
+    const { address, ...rest } = opts;
+    const reqOpts = { method: 'GET', timeout: 8000, ...rest };
+    if (address) {
+      const family = net.isIP(address) === 6 ? 6 : 4;
+      reqOpts.lookup = (hostname, o, cb) => cb(null, address, family);
+    }
+    const req = mod.request(url, reqOpts, (res) => {
       let body = '';
       res.on('data', c => body += c);
       res.on('end', () => resolve({ status: res.statusCode, body }));
     });
     req.on('error', e => reject(e));
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-    req.end(opts.body || undefined);
-  });
+    req.end(rest.body || undefined);
+  }));
   try {
     if (id === 'github') {
       const token = cfg.token || cfg.pat || '';
@@ -563,9 +577,11 @@ async function validateIntegration(id, cfg) {
       const token = cfg.token || cfg.pat || '';
       const url = cfg.url || 'https://gitlab.com';
       if (!token) return { ok: false, message: 'Token is required' };
-      const gate = await integrationUrlAllowed('gitlab', url);
+      const gate = await integrationUrlAllowed('gitlab', url, { resolve: options.resolve });
       if (!gate.ok) return { ok: false, message: `URL policy: ${gate.error}` };
-      const r = await fetch(`${gate.value}/api/v4/user`, { headers: { 'PRIVATE-TOKEN': token, Accept: 'application/json' } });
+      const r = await fetch(`${gate.value}/api/v4/user`, {
+        headers: { 'PRIVATE-TOKEN': token, Accept: 'application/json' }, address: gate.address,
+      });
       if (r.status === 200) { const u = JSON.parse(r.body); return { ok: true, message: `Authenticated as ${u.username}` }; }
       if (r.status === 401) return { ok: false, message: 'Invalid token — 401 Unauthorized' };
       return { ok: false, message: `GitLab returned ${r.status}` };
@@ -575,11 +591,13 @@ async function validateIntegration(id, cfg) {
       const email = cfg.email || '';
       const token = cfg.token || cfg.apitoken || '';
       if (!domain || !email || !token) return { ok: false, message: 'Domain, email and API token are required' };
-      const gate = await integrationUrlAllowed('jira', domain.startsWith('http') ? domain : `https://${domain}`);
+      const gate = await integrationUrlAllowed('jira', domain.startsWith('http') ? domain : `https://${domain}`, { resolve: options.resolve });
       if (!gate.ok) return { ok: false, message: `URL policy: ${gate.error}` };
       const base = gate.value;
       const auth = Buffer.from(`${email}:${token}`).toString('base64');
-      const r = await fetch(`${base}/rest/api/3/myself`, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
+      const r = await fetch(`${base}/rest/api/3/myself`, {
+        headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' }, address: gate.address,
+      });
       if (r.status === 200) { const u = JSON.parse(r.body); return { ok: true, message: `Authenticated as ${u.displayName || u.emailAddress}` }; }
       if (r.status === 401) return { ok: false, message: 'Invalid credentials — 401 Unauthorized' };
       return { ok: false, message: `Jira returned ${r.status}` };
@@ -2102,6 +2120,122 @@ function checkAuth(req, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Tiers, secret redaction and destructive confirms (SEC-007b). A route declares
+// what it needs; a secret leaves the server masked unless the caller proves it
+// holds the root token.
+// ---------------------------------------------------------------------------
+
+// Ordered D -> W; first match wins. Anything not listed falls back to R for a
+// safe method and W for an unsafe one, so a new mutating route fails closed.
+const TIER_RULES = [
+  { tier: 'D', method: 'DELETE', pattern: /^\/api\/runs$/, confirm: 'DELETE ALL' },
+  { tier: 'D', method: 'DELETE', pattern: /^\/api\/runs\/[^/]+$/ },
+  { tier: 'D', method: 'POST', pattern: /^\/api\/auth\/rotate$/ },
+  { tier: 'W', method: 'POST', pattern: /^\/api\/exploit$/ },
+  { tier: 'W', method: 'POST', pattern: /^\/api\/exploit\/[^/]+\/input$/ },
+  { tier: 'W', method: 'POST', pattern: /^\/api\/repl\/[^/]+\/input$/ },
+  { tier: 'W', method: 'POST', pattern: /^\/api\/leads\/generate$/ },
+  { tier: 'W', method: 'PUT', pattern: /^\/api\/config\// },
+  { tier: 'W', method: 'POST', pattern: /^\/api\/config\// },
+  { tier: 'W', method: 'DELETE', pattern: /^\/api\/config\// },
+];
+
+const SAFE_METHODS = ['GET', 'HEAD', 'OPTIONS'];
+
+function tierRuleFor(method, p) {
+  const m = String(method || 'GET').toUpperCase();
+  for (const r of TIER_RULES) {
+    if (r.method === m && r.pattern.test(String(p || ''))) return r;
+  }
+  return null;
+}
+
+function tierFor(method, p) {
+  const rule = tierRuleFor(method, p);
+  if (rule) return rule.tier;
+  return SAFE_METHODS.includes(String(method || 'GET').toUpperCase()) ? 'R' : 'W';
+}
+
+// `?reveal=1` is a D-tier capability: it needs the root token, not the cookie a
+// read-only session carries.
+function wasRootRequest(req) {
+  const m = /^Bearer\s+(.+)$/i.exec((req.headers && req.headers.authorization) || '');
+  return Boolean(m && safeEqual(m[1].trim(), rootToken()));
+}
+
+const SECRET_KEYS = ['token', 'pat', 'secret', 'secretkey', 'clientsecret', 'apitoken',
+  'bottoken', 'accesskey', 'apikey', 'password'];
+
+// The preview identifies which secret this is without disclosing it: the last
+// four characters, or only the length when the value is too short to hide.
+function redactSecret(v) {
+  const s = String(v);
+  if (s.length > 8) return { __masked__: true, preview: `…${s.slice(-4)}` };
+  return { __masked__: true, preview: `…${s.length}` };
+}
+
+function isMasked(v) {
+  return Boolean(v) && typeof v === 'object' && v.__masked__ === true && 'preview' in v;
+}
+
+// Masks only the named keys, so `name`, `url` and `enabled` survive — an
+// over-broad redactor corrupts the config on the next save.
+function redactEntry(obj, keys = SECRET_KEYS) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const out = { ...obj };
+  for (const k of Object.keys(out)) {
+    if (keys.includes(k.toLowerCase()) && typeof out[k] === 'string' && out[k]) {
+      out[k] = redactSecret(out[k]);
+    }
+  }
+  return out;
+}
+
+// A sentinel coming back in a PUT means "unchanged": substitute the stored value
+// rather than persisting the mask over the credential.
+function unmaskOnWrite(incoming, stored, keys = SECRET_KEYS) {
+  if (!incoming || typeof incoming !== 'object') return incoming;
+  const out = { ...incoming };
+  for (const k of Object.keys(out)) {
+    if (keys.includes(k.toLowerCase()) && isMasked(out[k]) && stored && typeof stored[k] === 'string') {
+      out[k] = stored[k];
+    }
+  }
+  return out;
+}
+
+function redactIntegration(entry) {
+  if (!entry || typeof entry !== 'object') return entry;
+  const out = { ...entry };
+  if (out.config && typeof out.config === 'object') out.config = redactEntry(out.config);
+  return redactEntry(out);
+}
+
+function unmaskVault(incoming, stored) {
+  const out = { ...(incoming || {}) };
+  for (const k of Object.keys(out)) {
+    if (isMasked(out[k]) && stored && typeof stored[k] === 'string') out[k] = stored[k];
+  }
+  return out;
+}
+
+function redactVault(vault) {
+  const out = {};
+  for (const [k, val] of Object.entries(vault || {})) {
+    out[k] = typeof val === 'string' ? redactSecret(val) : val;
+  }
+  return out;
+}
+
+// Edges are trimmed, the interior is not, and the comparison is case-sensitive:
+// a safety interlock that accepts "delete all" is decoration.
+function requireConfirm(body, phrase) {
+  const got = body && typeof body.confirm === 'string' ? body.confirm.trim() : '';
+  if (got !== phrase) return { ok: false, error: `confirm must be exactly "${phrase}"` };
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
 // Request pipeline (SEC-007): security headers, Host allowlist, rate limits,
 // Origin allowlist on unsafe methods, JSON-only bodies. Tiers, redaction,
 // idempotency and locks are SEC-007b/c.
@@ -2216,6 +2350,15 @@ const server = http.createServer(async (req, res) => {
         && p !== '/api/auth/status'
         && p !== '/api/auth/login') {
       if (!checkAuth(req).ok) return sendJson(res, 401, { error: 'authentication required' });
+    }
+
+    // ---- SEC-007b: a D-tier route with a phrase in the table must carry it ----
+    const tier = tierFor(req.method, p);
+    const tierRule = tierRuleFor(req.method, p);
+    if (tier === 'D' && tierRule && tierRule.confirm) {
+      const preBody = await readBody(req).catch(() => ({}));
+      const confirm = requireConfirm(preBody, tierRule.confirm);
+      if (!confirm.ok) return sendJson(res, 400, { error: confirm.error, field: 'confirm' });
     }
 
     // ---- pipeline stage 7: JSON-only bodies on unsafe methods ----
@@ -2743,16 +2886,26 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---- Config CRUD: integrations ----
-    if (req.method === 'GET' && p === '/api/config/integrations') return sendJson(res, 200, await readConfig('integrations'));
+    if (req.method === 'GET' && p === '/api/config/integrations') {
+      const list = await readConfig('integrations');
+      if (u.searchParams.get('reveal') === '1') {
+        if (!wasRootRequest(req)) return sendJson(res, 403, { error: 'reveal requires the root token' });
+        return sendJson(res, 200, list);
+      }
+      return sendJson(res, 200, list.map(redactIntegration));
+    }
     m = p.match(/^\/api\/config\/integrations\/([^/]+)$/);
     if (req.method === 'PUT' && m) {
       const body = await readBody(req);
       const id = decodeURIComponent(m[1]);
-      const cfg = body.config || {};
-      const validation = await validateIntegration(id, cfg);
       let integs = await readConfig('integrations');
       const idx = integs.findIndex(i => i.id === id);
-      const entry = { id, ...body, validation };
+      // A sentinel means "unchanged": keep the stored credential instead of
+      // persisting the mask over it.
+      const storedCfg = idx >= 0 ? (integs[idx].config || {}) : {};
+      const cfg = unmaskOnWrite(body.config || {}, storedCfg);
+      const validation = await validateIntegration(id, cfg);
+      const entry = { id, ...body, config: cfg, validation };
       if (idx >= 0) integs[idx] = { ...integs[idx], ...entry };
       else integs.push(entry);
       await writeConfig('integrations', integs);
@@ -2768,11 +2921,19 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---- Config: vault ----
-    if (req.method === 'GET' && p === '/api/config/vault') return sendJson(res, 200, await readConfigObj('vault'));
+    if (req.method === 'GET' && p === '/api/config/vault') {
+      const vault = await readConfigObj('vault');
+      if (u.searchParams.get('reveal') === '1') {
+        if (!wasRootRequest(req)) return sendJson(res, 403, { error: 'reveal requires the root token' });
+        return sendJson(res, 200, vault);
+      }
+      return sendJson(res, 200, redactVault(vault));
+    }
     if (req.method === 'PUT' && p === '/api/config/vault') {
       const body = await readBody(req);
-      await writeConfig('vault', body);
-      return sendJson(res, 200, body);
+      const next = unmaskVault(body, await readConfigObj('vault'));
+      await writeConfig('vault', next);
+      return sendJson(res, 200, redactVault(next));
     }
 
     // ---- Config: guardrails ----
@@ -2863,6 +3024,7 @@ module.exports = {
   atomicWriteSync, readJson, writeConfig, readConfig,
   authMode, checkAuth, issueSession,
   securityHeaders, hostAllowed, originAllowed, enforceJsonType, rateLimit,
+  tierFor, tierRuleFor, redactSecret, redactEntry, isMasked, unmaskOnWrite, requireConfirm, redactIntegration, redactVault, unmaskVault,
   materializeCreds, cleanupJobTemp,
 };
 

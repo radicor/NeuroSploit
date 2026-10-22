@@ -68,8 +68,53 @@ function onConfigAction(container, act, handler) {
   });
 }
 
+// ---- console auth bootstrap (SEC-005 carrying work, landed in SEC-007b) ----
+// A 401 is not a toast: the whole UI is unusable until the operator logs in, so
+// it gets a blocking overlay instead.
+function showAuthOverlay(message) {
+  if (document.getElementById('authOverlay')) return;
+  const el = document.createElement('div');
+  el.id = 'authOverlay';
+  el.setAttribute('role', 'dialog');
+  el.setAttribute('aria-modal', 'true');
+  el.style.cssText = 'position:fixed;inset:0;display:grid;place-items:center;background:rgba(0,0,0,.62);z-index:9999';
+  el.innerHTML = '<div style="max-width:32rem;padding:1.5rem;background:#14161a;border:1px solid #3a3f47;'
+    + 'border-radius:10px;color:#e8eaed;font:14px/1.5 system-ui,sans-serif">'
+    + '<h2 style="margin:0 0 .5rem;font-size:1.1rem">Console locked</h2>'
+    + `<p style="margin:0 0 .75rem">${esc(message || 'Authentication is required.')}</p>`
+    + '<p style="margin:0;opacity:.75">Use the one-time login URL the server printed, or send the token '
+    + 'in an Authorization: Bearer header.</p></div>';
+  document.body.appendChild(el);
+}
+
+// `?token=` is consumed once and stripped from the URL, so it never lands in
+// history or a shared link.
+async function bootstrapAuth() {
+  const params = new URLSearchParams(location.search);
+  const token = params.get('token');
+  if (token) {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    }).catch(() => null);
+    params.delete('token');
+    const qs = params.toString();
+    history.replaceState({}, '', location.pathname + (qs ? `?${qs}` : '') + location.hash);
+    if (!res || !res.ok) showAuthOverlay('That login token was not accepted.');
+    return;
+  }
+  const st = await fetch('/api/auth/status').then((r) => r.json()).catch(() => null);
+  if (st && st.auth === 'token' && !st.authenticated) {
+    showAuthOverlay('This console requires a login token.');
+  }
+}
+
 async function api(path, opts) {
   const res = await fetch(path, opts);
+  if (res.status === 401) {
+    showAuthOverlay('This console requires a login token.');
+    throw new Error('authentication required');
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.error || `${path} → ${res.status}`);
@@ -2782,6 +2827,7 @@ $('#btnNewEngagement')?.addEventListener('click', () => { if (window.matchMedia(
 window.matchMedia(NARROW).addEventListener('change', (m) => { if (!m.matches) setSidebar(false); });
 
 async function boot() {
+  await bootstrapAuth();
   applyTheme();
   switchView('dash');
   selectMode('run');
