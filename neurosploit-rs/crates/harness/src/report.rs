@@ -46,7 +46,22 @@ fn sev_color(s: &str) -> &'static str {
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    // Quotes are escaped too: the same values are interpolated into attributes
+    // in several templates, and a target-influenced string (a screenshot path,
+    // an endpoint) can otherwise close the attribute and add a handler.
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Escape a value for an attribute context. Same encoding as `esc`, plus C0
+/// control characters (except tab) are dropped — a newline or NUL inside an
+/// attribute is never legitimate and complicates anything that re-parses it.
+pub fn attr(s: &str) -> String {
+    let cleaned: String = s.chars().filter(|c| !c.is_control() || *c == '\t').collect();
+    esc(&cleaned)
 }
 
 /// Render an HTML report for the validated findings — same design language as
@@ -903,6 +918,34 @@ pub fn rebuild(dir: &Path) -> std::io::Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::types::Finding;
+
+    // SEC-006: a target-influenced value (screenshot path, endpoint, title) must
+    // not be able to close an attribute or a tag. The report puts finding data
+    // in element content and only fixed palette colours in attributes, so `esc`
+    // is the load-bearing function; `attr` is the attribute-context variant.
+    #[test]
+    fn esc_escapes_quotes_as_well_as_brackets() {
+        assert_eq!(esc("\""), "&quot;");
+        assert_eq!(esc("'"), "&#39;");
+        assert_eq!(esc("<script>"), "&lt;script&gt;");
+        assert_eq!(esc("a&b"), "a&amp;b");
+    }
+
+    #[test]
+    fn attr_escapes_quotes_and_drops_control_characters() {
+        let out = attr("x\" onerror=alert(1) y=\"");
+        assert!(!out.contains('"'), "a raw quote survived: {out}");
+        assert_eq!(out, "x&quot; onerror=alert(1) y=&quot;");
+        assert_eq!(attr("a\nb\0c"), "abc", "control characters must not reach an attribute");
+        assert_eq!(attr("keep\ttab"), "keep\ttab");
+    }
+
+    #[test]
+    fn attr_escapes_once() {
+        // TN-4: a raw ampersand is encoded exactly once, not twice.
+        assert_eq!(attr("a&b"), "a&amp;b");
+        assert!(!attr("a&b").contains("&amp;amp;"));
+    }
 
     #[test]
     fn markdown_separates_confirmed_and_needs_review() {

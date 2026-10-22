@@ -54,6 +54,20 @@ const state = {
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
+// Data never travels through an inline handler: `esc()` output inside
+// onclick="fn('…')" is HTML-decoded before the JS parser runs, so a quote in the
+// value becomes code again. The id rides in a data attribute instead and one
+// listener per container dispatches on data-act.
+function onConfigAction(container, act, handler) {
+  if (!container || container.dataset.delegated === act) return;
+  container.dataset.delegated = act;
+  container.addEventListener('click', (ev) => {
+    const btn = ev.target.closest(`[data-act="${act}"]`);
+    if (!btn || !container.contains(btn)) return;
+    handler(btn.dataset.id);
+  });
+}
+
 async function api(path, opts) {
   const res = await fetch(path, opts);
   if (!res.ok) {
@@ -3733,8 +3747,9 @@ async function loadRepos() {
       <div class="config-card-title">${esc(r.name || r.url)}</div>
       <div class="config-card-desc">${esc(r.description || r.url)}</div>
       <div class="config-card-meta">${esc(r.provider || 'git')} · ${esc(r.branch || 'main')}</div>
-      <div class="config-card-actions"><button class="btn btn-danger" onclick="deleteRepo('${esc(r.id)}')">Remove</button></div>
+      <div class="config-card-actions"><button class="btn btn-danger" data-act="delete-repo" data-id="${esc(r.id)}">Remove</button></div>
     </div>`).join('') + '</div>';
+    onConfigAction(body, 'delete-repo', deleteRepo);
   } catch { body.innerHTML = '<div class="empty-state">No repositories connected yet. Click <strong>+ Add Repository</strong> to connect one.</div>'; }
 }
 
@@ -3749,8 +3764,9 @@ async function loadDomains() {
       <div class="config-card-title">${esc(d.domain)}</div>
       <div class="config-card-desc">${esc(d.description || 'Target domain')}</div>
       <div class="config-card-meta">${esc(typeLabel[d.type] || d.type || 'Web')} · ${d.subdomains ? d.subdomains.length + ' subdomains' : 'No subdomains'} · ${esc(d.scope || 'in-scope')}</div>
-      <div class="config-card-actions"><button class="btn btn-danger" onclick="deleteDomain('${esc(d.id)}')">Remove</button></div>
+      <div class="config-card-actions"><button class="btn btn-danger" data-act="delete-domain" data-id="${esc(d.id)}">Remove</button></div>
     </div>`).join('') + '</div>';
+    onConfigAction(body, 'delete-domain', deleteDomain);
   } catch { body.innerHTML = '<div class="empty-state">No domains configured yet. Click <strong>+ Add Domain</strong> to add one.</div>'; }
 }
 
@@ -3764,8 +3780,9 @@ async function loadNetworks() {
       <div class="config-card-title">${esc(n.name || n.cidr)}</div>
       <div class="config-card-desc">${esc(n.description || n.cidr)}</div>
       <div class="config-card-meta">${esc(n.cidr)} · ${esc(n.transport || 'direct')}</div>
-      <div class="config-card-actions"><button class="btn btn-danger" onclick="deleteNetwork('${esc(n.id)}')">Remove</button></div>
+      <div class="config-card-actions"><button class="btn btn-danger" data-act="delete-network" data-id="${esc(n.id)}">Remove</button></div>
     </div>`).join('') + '</div>';
+    onConfigAction(body, 'delete-network', deleteNetwork);
   } catch { body.innerHTML = '<div class="empty-state">No networks configured yet. Click <strong>+ Add Network</strong> to add one.</div>'; }
 }
 
@@ -3791,9 +3808,10 @@ async function loadIntegrations() {
         <div class="config-card-title">${esc(c.name)}</div>
         <div class="config-card-desc">${esc(c.desc)}</div>
         <div class="config-card-meta"><span class="integration-dot ${on ? 'connected' : 'disconnected'}"></span> ${on ? 'Connected' : 'Not configured'}</div>
-        <div class="config-card-actions"><button class="btn" onclick="configureIntegration('${c.id}')">${on ? 'Configure' : 'Connect'}</button></div>
+        <div class="config-card-actions"><button class="btn" data-act="configure-integration" data-id="${esc(c.id)}">${on ? 'Configure' : 'Connect'}</button></div>
       </div>`;
     }).join('') + '</div>';
+    onConfigAction(body, 'configure-integration', configureIntegration);
   } catch { body.innerHTML = '<div class="empty-state">Failed to load integrations.</div>'; }
 }
 

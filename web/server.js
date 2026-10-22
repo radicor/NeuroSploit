@@ -274,6 +274,17 @@ function resolveRunDir(id) {
   return { ok: true, value: dir };
 }
 
+/// Build a stored config entry. The id is always server-generated: the same id
+/// is interpolated into a template attribute later, so a client-chosen value
+/// there is a stored-XSS primitive, not a naming preference. Every other field
+/// is preserved — an over-broad strip would silently drop `name`, `url`, etc.
+function newConfigItem(body) {
+  const rest = { ...(body && typeof body === 'object' ? body : {}) };
+  delete rest.id;
+  delete rest.createdAt;
+  return { id: crypto.randomUUID(), ...rest, createdAt: new Date().toISOString() };
+}
+
 /// Remove the files materialize*() wrote for one job.
 function cleanupJobTemp(jobId) {
   const root = TEMP_ROOT;
@@ -1939,6 +1950,22 @@ async function serveStatic(req, res, urlPath) {
   }
 }
 
+// Response headers for a run artifact. These files are produced while attacking
+// a hostile target, so their bytes are never rendered on the console's origin:
+// the type is always octet-stream and the disposition always an attachment.
+// `MIME` above stays in place for serveStatic — the SPA's own files must keep
+// their real types. The extension is accepted so call sites read naturally and
+// deliberately ignored: no extension earns a renderable type.
+function assetHeaders(ext, name) {
+  const base = path.basename(String(name || 'asset')).replace(/["\\\r\n]/g, '') || 'asset';
+  return {
+    'Content-Type': 'application/octet-stream',
+    'Content-Disposition': `attachment; filename="${base}"`,
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': "default-src 'none'; sandbox",
+  };
+}
+
 async function serveRunAsset(req, res, id, rest) {
   const dir = safeRunDir(id);
   if (!dir) { res.writeHead(400); res.end(); return; }
@@ -1948,7 +1975,7 @@ async function serveRunAsset(req, res, id, rest) {
   try {
     const data = await fsp.readFile(full);
     const ext = path.extname(full);
-    res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
+    res.writeHead(200, assetHeaders(ext, path.basename(full)));
     res.end(data);
   } catch {
     res.writeHead(404);
@@ -2409,7 +2436,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && p === '/api/config/repos') {
       const body = await readBody(req);
       const repos = await readConfig('repos');
-      const item = { id: crypto.randomUUID(), ...body, createdAt: new Date().toISOString() };
+      const item = newConfigItem(body);
       repos.push(item);
       await writeConfig('repos', repos);
       return sendJson(res, 200, item);
@@ -2427,7 +2454,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && p === '/api/config/domains') {
       const body = await readBody(req);
       const domains = await readConfig('domains');
-      const item = { id: crypto.randomUUID(), ...body, createdAt: new Date().toISOString() };
+      const item = newConfigItem(body);
       domains.push(item);
       await writeConfig('domains', domains);
       return sendJson(res, 200, item);
@@ -2445,7 +2472,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && p === '/api/config/networks') {
       const body = await readBody(req);
       const networks = await readConfig('networks');
-      const item = { id: crypto.randomUUID(), ...body, createdAt: new Date().toISOString() };
+      const item = newConfigItem(body);
       networks.push(item);
       await writeConfig('networks', networks);
       return sendJson(res, 200, item);
@@ -2560,7 +2587,7 @@ module.exports = {
   startServer, bindAddress, bindBanner, isLoopback, metaPayload,
   buildArgs, buildReplScript, authArgs,
   MODE_ALLOWLIST, checkPositional, safeReplValue, confinePath, resolveRunDir,
-  isPrivateAddress, integrationUrlAllowed, validateIntegration,
+  isPrivateAddress, integrationUrlAllowed, validateIntegration, assetHeaders, newConfigItem,
   materializeCreds, cleanupJobTemp,
 };
 
