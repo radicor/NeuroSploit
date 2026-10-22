@@ -2039,6 +2039,62 @@ async function serveRunAsset(req, res, id, rest) {
 }
 
 // ---------------------------------------------------------------------------
+// Live-dock stdin allowlist (SEC-003). The two /input endpoints used to write
+// arbitrary bytes into a live REPL. A slash line is ALWAYS a command here — the
+// gate cannot know whether a dialoguer prompt is open, so anything that could
+// reach the child as a command is refused rather than forwarded.
+// ---------------------------------------------------------------------------
+const REPL_COMMANDS = new Set(['/pause', '/continue', '/resume', '/stop', '/status', '/agents', '/help']);
+// Retargeting the engagement mid-run needs the destructive tier AND an explicit
+// body-field confirm.
+const OPERATOR_COMMANDS = new Set(['/quit', '/proxy', '/target', '/creds', '/key', '/scope', '/sandbox']);
+
+function classifyStdinLine(raw) {
+  const text = String(raw == null ? '' : raw).replace(/[\r\n]+$/, '');
+  if (text === '\u0003') return { kind: 'ctrl-c' };
+  if (!text.startsWith('/')) return { kind: 'text' };
+  // First token only, case-sensitive: no folding, so /PAUSE is not /pause.
+  const command = text.split(/\s+/)[0];
+  if (REPL_COMMANDS.has(command)) return { kind: 'allow', command };
+  if (OPERATOR_COMMANDS.has(command)) return { kind: 'operator', command };
+  return { kind: 'reject', command, reason: 'unknown command' };
+}
+
+function gateStdin(raw, opts = {}) {
+  const maxBytes = opts.maxBytes || 65536;
+  const text = String(raw == null ? '' : raw);
+  // Cap before anything else: a 10 MB body must not be classified, logged, or
+  // forwarded.
+  if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+    return { ok: false, status: 413, error: `stdin payload exceeds ${maxBytes} bytes` };
+  }
+  // One line only: a second command must not ride in behind a permitted one.
+  if (/[\r\n]\s*\S/.test(text) || /^[\r\n]/.test(text) && text.replace(/[\r\n]/g, '').length > 0) {
+    const interior = text.slice(0, -1);
+    if (/[\r\n]/.test(interior)) {
+      return { ok: false, status: 400, error: 'stdin input must be a single line' };
+    }
+  }
+  const cls = classifyStdinLine(text);
+  if (cls.kind === 'reject') {
+    return { ok: false, status: 400, error: `command not allowed: ${cls.command}`, command: cls.command };
+  }
+  if (cls.kind === 'operator') {
+    if (opts.tier !== 'D' || opts.confirm !== true) {
+      return { ok: false, status: 400, error: `command requires the destructive tier and confirm: ${cls.command}`, command: cls.command };
+    }
+    return { ok: true, action: 'write', payload: `${cls.command}${text.slice(cls.command.length)}\n` };
+  }
+  if (cls.kind === 'ctrl-c') {
+    // A control action, never a raw byte: nothing turns 0x03 into SIGINT over a
+    // pipe, and a stray half-line must not be able to interrupt.
+    if (!opts.running) return { ok: false, status: 400, error: 'nothing is running to interrupt' };
+    return { ok: true, action: 'signal', payload: null };
+  }
+  return { ok: true, action: 'write', payload: `${text.replace(/^[\r\n]+/, '')}\n` };
+}
+
+// ---------------------------------------------------------------------------
 // Idempotency, per-name config locks and finished-job pruning (SEC-007c).
 // ---------------------------------------------------------------------------
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
@@ -2719,7 +2775,20 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 409, { error: 'this job is not an interactive session (host/aitest/skills engagements run non-interactively)' });
       }
       const body = await readBody(req);
-      job.child.stdin.write(String(body.line ?? '') + '\n');
+      const gate = gateStdin(String(body.line ?? ''), {
+        tier: tierFor('POST', p), confirm: body.confirm === true, running: !job.done,
+      });
+      if (!gate.ok) {
+        if (gate.command) {
+          console.error(`refused stdin command "${gate.command}" from ${req.socket.remoteAddress || 'unknown'}`);
+        }
+        return sendJson(res, gate.status, { error: gate.error });
+      }
+      if (gate.action === 'signal') {
+        job.child.kill('SIGINT');
+        return sendJson(res, 200, { ok: true, signalled: 'SIGINT' });
+      }
+      job.child.stdin.write(gate.payload);
       return sendJson(res, 200, { ok: true });
     }
     m = p.match(/^\/api\/exploit\/([^/]+)\/events$/);
@@ -2759,7 +2828,18 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, { ok: true, signalled: 'SIGINT' });
       }
       if (!session.child.stdin.writable) return sendJson(res, 409, { error: 'session has ended' });
-      session.child.stdin.write(raw);
+      const gate = gateStdin(raw, { tier: tierFor('POST', p), confirm: body.confirm === true, running: true });
+      if (!gate.ok) {
+        if (gate.command) {
+          console.error(`refused stdin command "${gate.command}" from ${req.socket.remoteAddress || 'unknown'}`);
+        }
+        return sendJson(res, gate.status, { error: gate.error });
+      }
+      if (gate.action === 'signal') {
+        session.child.kill('SIGINT');
+        return sendJson(res, 200, { ok: true, signalled: 'SIGINT' });
+      }
+      session.child.stdin.write(gate.payload);
       return sendJson(res, 200, { ok: true });
     }
     m = p.match(/^\/api\/repl\/([^/]+)\/stop$/);
@@ -3143,6 +3223,7 @@ module.exports = {
   atomicWriteSync, readJson, writeConfig, readConfig,
   authMode, checkAuth, issueSession,
   securityHeaders, hostAllowed, originAllowed, enforceJsonType, rateLimit,
+  REPL_COMMANDS, OPERATOR_COMMANDS, classifyStdinLine, gateStdin,
   idempotencyKey, bodyDigest, withIdempotency, duplicateLaunch, withConfigLock, pruneJobs, mutateConfig,
   tierFor, tierRuleFor, redactSecret, redactEntry, isMasked, unmaskOnWrite, requireConfirm, redactIntegration, redactVault, unmaskVault,
   materializeCreds, cleanupJobTemp,
