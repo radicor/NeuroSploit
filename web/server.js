@@ -2101,14 +2101,113 @@ function checkAuth(req, opts = {}) {
   return { ok: false };
 }
 
+// ---------------------------------------------------------------------------
+// Request pipeline (SEC-007): security headers, Host allowlist, rate limits,
+// Origin allowlist on unsafe methods, JSON-only bodies. Tiers, redaction,
+// idempotency and locks are SEC-007b/c.
+// ---------------------------------------------------------------------------
+function securityHeaders() {
+  return {
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';"
+      + " img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self';"
+      + " frame-ancestors 'none'",
+    'Cache-Control': 'no-store',
+  };
+}
+
+function envList(name) {
+  return (process.env[name] || '')
+    .split(',').map((v) => v.trim().toLowerCase()).filter((v) => v && v !== '*');
+}
+
+// Host is checked on EVERY request: Origin only guards unsafe methods, but a
+// rebound Host lets a page read responses.
+function hostAllowed(hostHeader) {
+  if (!hostHeader) return false;
+  const h = String(hostHeader).trim().toLowerCase().replace(/:\d+$/, '');
+  if (!h) return false;
+  return ['127.0.0.1', 'localhost', '[::1]'].concat(envList('NEUROSPLOIT_WEB_TRUSTED_HOSTS')).includes(h);
+}
+
+// No Origin means a non-browser client (curl, the acceptance harness); refusing
+// those would break every script.
+function originAllowed(originHeader, hostHeader) {
+  if (!originHeader) return true;
+  let origin;
+  try { origin = new URL(String(originHeader)).origin.toLowerCase(); } catch { return false; }
+  if (envList('NEUROSPLOIT_WEB_TRUSTED_ORIGINS').includes(origin)) return true;
+  const host = String(hostHeader || '').trim().toLowerCase();
+  if (!host) return false;
+  return [`http://${host}`, `https://${host}`].includes(origin);
+}
+
+const UNSAFE = ['POST', 'PUT', 'PATCH', 'DELETE'];
+
+function enforceJsonType(method, contentType) {
+  if (!UNSAFE.includes(String(method || '').toUpperCase())) return true;
+  return /^application\/json\b/i.test(String(contentType || ''));
+}
+
+const RATE_BUCKETS = {
+  launch: { limit: 6, windowMs: 60000 },
+  login: { limit: 10, windowMs: 60000 },
+  stdin: { limit: 120, windowMs: 60000 },
+  general: { limit: 300, windowMs: 60000 },
+};
+const rateState = new Map();
+
+// Token bucket per caller. Keyed by session when one exists, else peer address,
+// so one client's flood cannot lock the operator out.
+function rateLimit(key, bucket) {
+  const spec = typeof bucket === 'string' ? RATE_BUCKETS[bucket] : bucket;
+  if (!spec || !spec.limit) return { ok: true };
+  const k = `${key}:${spec.limit}:${spec.windowMs}`;
+  const now = Date.now();
+  if (rateState.size > 1000) {
+    for (const [kk, vv] of rateState) {
+      if (now - vv.ts > vv.windowMs) rateState.delete(kk);
+    }
+  }
+  let st = rateState.get(k);
+  if (!st) { st = { tokens: spec.limit, ts: now, windowMs: spec.windowMs }; rateState.set(k, st); }
+  st.tokens = Math.min(spec.limit, st.tokens + ((now - st.ts) / spec.windowMs) * spec.limit);
+  st.ts = now;
+  if (st.tokens >= 1) { st.tokens -= 1; return { ok: true }; }
+  const needMs = ((1 - st.tokens) / spec.limit) * spec.windowMs;
+  return { ok: false, retryAfter: Math.max(1, Math.ceil(needMs / 1000)) };
+}
+
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://localhost');
   const p = u.pathname;
 
   try {
+    // ---- pipeline stage 1-2: headers, then Host (rebinding guards reads too) ----
+    for (const [hk, hv] of Object.entries(securityHeaders())) res.setHeader(hk, hv);
+    if (!hostAllowed(req.headers.host)) {
+      return sendJson(res, 403, { error: 'untrusted host' });
+    }
+
     // ---- static ----
     if (req.method === 'GET' && !p.startsWith('/api/')) {
       return serveStatic(req, res, p);
+    }
+
+    // ---- pipeline stage 4-5: rate limit, then Origin on unsafe methods ----
+    const rlKey = req.socket.remoteAddress || 'unknown';
+    const bucket = (req.method === 'POST' && p === '/api/exploit') ? 'launch'
+      : (req.method === 'POST' && p === '/api/auth/login') ? 'login'
+      : 'general';
+    const rl = rateLimit(rlKey, bucket);
+    if (!rl.ok) {
+      res.setHeader('Retry-After', String(rl.retryAfter));
+      return sendJson(res, 429, { error: 'rate limited' });
+    }
+    if (UNSAFE.includes(req.method) && !originAllowed(req.headers.origin, req.headers.host)) {
+      return sendJson(res, 403, { error: 'cross-origin request refused' });
     }
 
     // ---- auth gate (SEC-005): static is public, /api/* is not ----
@@ -2117,6 +2216,13 @@ const server = http.createServer(async (req, res) => {
         && p !== '/api/auth/status'
         && p !== '/api/auth/login') {
       if (!checkAuth(req).ok) return sendJson(res, 401, { error: 'authentication required' });
+    }
+
+    // ---- pipeline stage 7: JSON-only bodies on unsafe methods ----
+    const hasBody = Number(req.headers['content-length'] || 0) > 0
+      || Boolean(req.headers['transfer-encoding']);
+    if (hasBody && !enforceJsonType(req.method, req.headers['content-type'])) {
+      return sendJson(res, 415, { error: 'Content-Type must be application/json' });
     }
 
     // ---- auth endpoints ----
@@ -2756,6 +2862,7 @@ module.exports = {
   isPrivateAddress, integrationUrlAllowed, validateIntegration, assetHeaders, newConfigItem,
   atomicWriteSync, readJson, writeConfig, readConfig,
   authMode, checkAuth, issueSession,
+  securityHeaders, hostAllowed, originAllowed, enforceJsonType, rateLimit,
   materializeCreds, cleanupJobTemp,
 };
 
