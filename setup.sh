@@ -28,10 +28,10 @@ cat <<'BANNER'
 
    ███╗   ██╗███████╗██╗   ██╗██████╗  ██████╗
    ████╗  ██║██╔════╝██║   ██║██╔══██╗██╔═══██╗   NeuroSploit installer
-   ██╔██╗ ██║█████╗  ██║   ██║██████╔╝██║   ██║   v4.3.1 — Rust harness
+   ██╔██╗ ██║█████╗  ██║   ██║██████╔╝██║   ██║   — Rust harness
    ██║╚██╗██║██╔══╝  ██║   ██║██╔══██╗██║   ██║   by Joas A Santos
    ██║ ╚████║███████╗╚██████╔╝██║  ██║╚██████╔╝   & Red Team Leaders
-   ╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝        v4.3.1
+   ╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝
 BANNER
 
 # ---- platform detection (Linux / macOS / Windows-WSL · x64 / arm64) ----
@@ -58,12 +58,72 @@ dl() { # dl <url> <out>
 }
 
 # ---- resolve the release tag (latest, unless pinned) ----
-REF="${NEUROSPLOIT_REF:-}"
-if [ -z "$REF" ]; then
-  REF="$(dl "https://api.github.com/repos/${REPO_SLUG}/releases/latest" /dev/stdout 2>/dev/null \
+# Never invent a version: a hard-coded fallback silently installs whatever was
+# current when this script was written.
+resolve_ref() {
+  r="${NEUROSPLOIT_REF:-}"
+  if [ -z "$r" ]; then
+    r="$(dl "https://api.github.com/repos/${REPO_SLUG}/releases/latest" /dev/stdout 2>/dev/null \
          | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name" *: *"([^"]+)".*/\1/' || true)"
-fi
-[ -z "$REF" ] && REF="v4.3.1"
+  fi
+  if [ -z "$r" ]; then
+    for f in "$(dirname "$0")/neurosploit-rs/Cargo.toml" ./neurosploit-rs/Cargo.toml; do
+      if [ -f "$f" ]; then
+        v="$(sed -nE 's/^version *= *"([^"]+)".*/\1/p' "$f" | head -1)"
+        if [ -n "$v" ]; then r="v$v"; break; fi
+      fi
+    done
+  fi
+  if [ -z "$r" ]; then
+    echo "error: cannot determine the release tag; set NEUROSPLOIT_REF=vX.Y.Z" >&2
+    return 1
+  fi
+  printf '%s\n' "$r"
+}
+
+# verify_archive <dir> <archive-name>
+# A mismatch ALWAYS aborts. NEUROSPLOIT_INSECURE=1 exempts only a *missing* sums
+# file (old tags), never altered bytes — otherwise the flag means "install anything".
+verify_archive() {
+  vdir="$1"; vname="$2"
+  if [ ! -f "$vdir/SHA256SUMS" ]; then
+    if [ "${NEUROSPLOIT_INSECURE:-0}" = "1" ]; then
+      warn "SHA256SUMS missing for this release — continuing because NEUROSPLOIT_INSECURE=1"
+      return 0
+    fi
+    echo "error: SHA256SUMS missing; refusing to install unverified (set NEUROSPLOIT_INSECURE=1 only for old tags)" >&2
+    return 1
+  fi
+  vline="$(grep -E "[[:space:]]\*?${vname}\$" "$vdir/SHA256SUMS" | head -1)"
+  if [ -z "$vline" ]; then
+    echo "error: SHA256SUMS has no entry for ${vname}" >&2
+    return 1
+  fi
+  # one line only: an entry for a different asset must not satisfy this check
+  printf '%s\n' "$vline" > "$vdir/.verify-$$.sum"
+  # Absorb the failure explicitly: under `set -e` (which leaks in when this file is
+  # sourced) an uncaught non-zero would kill the function before vrc is captured,
+  # making the abort an errexit accident rather than this guard's return contract.
+  vrc=0
+  ( cd "$vdir" && sha256sum -c ".verify-$$.sum" >/dev/null 2>&1 ) || vrc=$?
+  rm -f "$vdir/.verify-$$.sum"
+  return $vrc
+}
+
+# Sourced by installer/test/checksums.test.sh: define the functions, then stop.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
+
+# PREFIX is a write target and gets prepended to PATH; outside $HOME needs consent.
+UNSAFE_PREFIX=0
+for a in "$@"; do [ "$a" = "--unsafe-prefix" ] && UNSAFE_PREFIX=1; done
+case "$PREFIX" in
+  "$HOME"/*) : ;;
+  *) if [ "$UNSAFE_PREFIX" != "1" ]; then
+       die "refusing to write to $PREFIX (outside \$HOME); pass --unsafe-prefix if that is intended"
+     fi ;;
+esac
+
+REF="$(resolve_ref)" || die "cannot determine the release tag"
 say "Release: $REF"
 
 installed=0
@@ -73,9 +133,15 @@ if [ "${NEUROSPLOIT_BUILD:-0}" != "1" ] && [ "$OS" != "windows" ]; then
   URL="https://github.com/${REPO_SLUG}/releases/download/${REF}/${ASSET}"
   TMP="$(mktemp -d)"
   say "Downloading prebuilt binary: $ASSET"
-  if dl "$URL" "$TMP/a.tar.gz"; then
+  if dl "$URL" "$TMP/$ASSET"; then
     mkdir -p "$DIR"
-    tar -xzf "$TMP/a.tar.gz" -C "$TMP" 2>/dev/null || die "download was not a valid archive"
+    # Verify BEFORE unpacking: extraction of an unverified archive is the risk.
+    dl "https://github.com/${REPO_SLUG}/releases/download/${REF}/SHA256SUMS" "$TMP/SHA256SUMS" 2>/dev/null || true
+    if ! verify_archive "$TMP" "$ASSET"; then
+      rm -rf "$TMP"
+      die "checksum verification failed for $ASSET"
+    fi
+    tar -xzf "$TMP/$ASSET" -C "$TMP" 2>/dev/null || die "download was not a valid archive"
     SRC="$(find "$TMP" -maxdepth 2 -name neurosploit -type f | head -1)"
     [ -n "$SRC" ] || die "extracted archive has no neurosploit binary"
     SRCDIR="$(dirname "$SRC")"
@@ -98,7 +164,19 @@ if [ "$installed" != "1" ]; then
   if ! command -v cargo >/dev/null 2>&1; then [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env" || true; fi
   if ! command -v cargo >/dev/null 2>&1; then
     say "Rust not found — installing rustup (stable, minimal)…"
-    curl --proto '=https' --tlsv1.2 -fsSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+    RUSTUP_TMP="$(mktemp -d)"
+    if ! dl "https://sh.rustup.rs" "$RUSTUP_TMP/rustup.sh"; then
+      rm -rf "$RUSTUP_TMP"; die "could not download the rustup installer"
+    fi
+    if [ -n "${NEUROSPLOIT_RUSTUP_SHA256:-}" ]; then
+      printf '%s  %s\n' "$NEUROSPLOIT_RUSTUP_SHA256" "$RUSTUP_TMP/rustup.sh" > "$RUSTUP_TMP/sum"
+      ( cd "$RUSTUP_TMP" && sha256sum -c sum >/dev/null 2>&1 ) \
+        || { rm -rf "$RUSTUP_TMP"; die "rustup installer failed checksum verification"; }
+    else
+      warn "no pinned checksum for the rustup installer — set NEUROSPLOIT_RUSTUP_SHA256 to verify it"
+    fi
+    sh "$RUSTUP_TMP/rustup.sh" -y --default-toolchain stable --profile minimal
+    rm -rf "$RUSTUP_TMP"
     . "$HOME/.cargo/env"
   fi
   ok "Rust: $(cargo --version)"

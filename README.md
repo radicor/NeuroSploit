@@ -69,6 +69,12 @@ is adjudicated by a **second model** before it reaches the report.
 ```bash
 curl -fsSL https://raw.githubusercontent.com/JoasASantos/NeuroSploit/main/setup.sh | bash
 ```
+
+> The installer verifies the release archive against the published `SHA256SUMS`
+> and aborts on a mismatch. `NEUROSPLOIT_INSECURE=1` exists only for old tags that
+> predate the sums file — it never excuses altered bytes. Read the script before
+> piping it to a shell; `curl | bash` executes whatever the server returns.
+
 **Windows** (PowerShell):
 ```powershell
 irm https://raw.githubusercontent.com/JoasASantos/NeuroSploit/main/install.ps1 | iex

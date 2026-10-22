@@ -14,7 +14,7 @@ function Ok ($m) { Write-Host "  + $m" -ForegroundColor Green }
 function Warn($m){ Write-Host "  ! $m" -ForegroundColor Yellow }
 
 Write-Host ""
-Write-Host "  NeuroSploit installer (Windows) — v4.3.1" -ForegroundColor Cyan
+Write-Host "  NeuroSploit installer (Windows)" -ForegroundColor Cyan
 
 # arch → asset arch (only x64 prebuilt today; arm64 falls back to source)
 $rawArch = $env:PROCESSOR_ARCHITECTURE
@@ -29,22 +29,50 @@ $ref  = $env:NEUROSPLOIT_REF
 if (-not $ref) {
   try { $ref = (Invoke-RestMethod "https://api.github.com/repos/$slug/releases/latest").tag_name } catch { }
 }
-if (-not $ref) { $ref = "v4.3.1" }
+if (-not $ref) {
+  # never invent a version: a checkout knows its own, otherwise fail
+  $ct = Join-Path $PSScriptRoot "neurosploit-rs\Cargo.toml"
+  if (Test-Path $ct) {
+    $m = Select-String -Path $ct -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+    if ($m) { $ref = "v" + $m.Matches[0].Groups[1].Value }
+  }
+}
+if (-not $ref) { throw "cannot determine the release tag; set NEUROSPLOIT_REF=vX.Y.Z" }
 Say "Release: $ref"
 
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $installed = $false
 
+# A mismatch ALWAYS throws. NEUROSPLOIT_INSECURE=1 exempts only a missing sums
+# file (old tags), never altered bytes.
+function Assert-Checksum {
+  param([string]$Path, [string]$Name, [string]$SumsPath)
+  if (-not (Test-Path $SumsPath)) {
+    if ($env:NEUROSPLOIT_INSECURE -eq "1") {
+      Write-Warning "SHA256SUMS missing for this release - continuing because NEUROSPLOIT_INSECURE=1"
+      return
+    }
+    throw "SHA256SUMS missing; refusing to install unverified (set NEUROSPLOIT_INSECURE=1 only for old tags)"
+  }
+  $line = Get-Content $SumsPath | Where-Object { $_ -match "\s\*?$([regex]::Escape($Name))$" } | Select-Object -First 1
+  if (-not $line) { throw "SHA256SUMS has no entry for $Name" }
+  $expected = ($line -split '\s+')[0].ToLower()
+  $actual = (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLower()
+  if ($expected -ne $actual) { throw "checksum mismatch for $Name" }
+}
+
 # ---- try the prebuilt asset (no Rust needed; x64 only) ----
 if ($env:NEUROSPLOIT_BUILD -ne "1" -and $arch -eq "x64") {
   $asset = "neurosploit-$ref-windows-x64.zip"
   $url   = "https://github.com/$slug/releases/download/$ref/$asset"
-  $tmp   = Join-Path $env:TEMP "ns-dl"
+  $tmp   = Join-Path $env:TEMP ("ns-dl-" + [guid]::NewGuid().ToString("N"))
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Force -Path $tmp | Out-Null
   try {
     Say "Downloading prebuilt binary: $asset"
     Invoke-WebRequest $url -OutFile (Join-Path $tmp "a.zip")
+    try { Invoke-WebRequest "https://github.com/$slug/releases/download/$ref/SHA256SUMS" -OutFile (Join-Path $tmp "SHA256SUMS") } catch { }
+    Assert-Checksum -Path (Join-Path $tmp "a.zip") -Name $asset -SumsPath (Join-Path $tmp "SHA256SUMS")
     Expand-Archive -Path (Join-Path $tmp "a.zip") -DestinationPath $tmp -Force
     $exe = Get-ChildItem -Path $tmp -Recurse -Filter neurosploit.exe | Select-Object -First 1
     if (-not $exe) { throw "no neurosploit.exe in archive" }
@@ -68,8 +96,16 @@ if (-not $installed) {
     if (Get-Command winget -ErrorAction SilentlyContinue) {
       winget install -e --id Rustlang.Rustup --accept-source-agreements --accept-package-agreements
     } else {
-      $ri = Join-Path $env:TEMP "rustup-init.exe"
+      $rdir = Join-Path $env:TEMP ("ns-rustup-" + [guid]::NewGuid().ToString("N"))
+      New-Item -ItemType Directory -Force -Path $rdir | Out-Null
+      $ri = Join-Path $rdir "rustup-init.exe"
       Invoke-WebRequest "https://win.rustup.rs/$rawArch" -OutFile $ri
+      if ($env:NEUROSPLOIT_RUSTUP_SHA256) {
+        $h = (Get-FileHash -Path $ri -Algorithm SHA256).Hash.ToLower()
+        if ($h -ne $env:NEUROSPLOIT_RUSTUP_SHA256.ToLower()) { throw "rustup-init.exe failed checksum verification" }
+      } else {
+        Write-Warning "no pinned checksum for rustup-init.exe - set NEUROSPLOIT_RUSTUP_SHA256 to verify it"
+      }
       & $ri -y --default-toolchain stable --profile minimal
     }
     $env:Path = "$HOME\.cargo\bin;$env:Path"

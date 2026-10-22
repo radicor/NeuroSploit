@@ -94,3 +94,21 @@ jobs:
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
           gh release upload "$TAG" dist/neurosploit-*.${{ matrix.ext }} --clobber
+
+  # Every asset is hashed after the matrix finishes, in one job: a per-matrix job
+  # would upload a SHA256SUMS covering only its own artefact. The glob is the
+  # point — a new arch cannot ship unverified.
+  checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish SHA256SUMS for every asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p sums && cd sums
+          gh release download "$TAG" --pattern 'neurosploit-*' --dir .
+          sha256sum neurosploit-* > SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --clobber
+          cat SHA256SUMS
