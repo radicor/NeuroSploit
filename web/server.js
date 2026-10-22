@@ -284,6 +284,82 @@ function cleanupJobTemp(jobId) {
 }
 
 // ---------------------------------------------------------------------------
+// Integration URL policy (SEC-013a). Saving an integration makes this process
+// fetch a URL and attach the operator's credential, so the host must be one the
+// provider actually lives on and must not be anywhere private.
+// ---------------------------------------------------------------------------
+
+// Hosts each provider may be reached at. An entry allows itself and its
+// subdomains; the comparison is dot-anchored so gitlab.com.evil.test fails.
+const INTEGRATION_HOSTS = {
+  gitlab: ['gitlab.com'],
+  jira: ['atlassian.net'],
+};
+
+function isPrivateAddress(ip) {
+  if (typeof ip !== 'string') return true;
+  let a = ip.trim().toLowerCase().replace(/^\[|\]$/g, '').replace(/^::ffff:/, '');
+  if (!a) return true;
+  if (a === '::1' || a === '::') return true;
+  if (/^f[cd]/.test(a)) return true;                       // fc00::/7 unique local
+  if (/^fe[89ab]/.test(a)) return true;                    // fe80::/10 link-local
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(a);
+  if (!m) return !a.includes(':');                         // not an IP at all: fail closed
+  const o = m.slice(1).map(Number);
+  if (o.some((x) => x > 255)) return true;
+  const [x, y] = o;
+  if (x === 0 || x === 10 || x === 127) return true;       // this-host / RFC1918 / loopback
+  if (x === 169 && y === 254) return true;                 // link-local incl. cloud metadata
+  if (x === 172 && y >= 16 && y <= 31) return true;        // RFC1918
+  if (x === 192 && y === 168) return true;                 // RFC1918
+  if (x === 100 && y >= 64 && y <= 127) return true;       // CGNAT
+  if (x >= 224) return true;                               // multicast + reserved
+  return false;
+}
+
+function hostInList(host, list) {
+  const h = host.toLowerCase();
+  return list.some((allowed) => h === allowed || h.endsWith(`.${allowed}`));
+}
+
+/// May this provider be reached at this URL? Refuses a non-HTTPS scheme, a host
+/// outside the provider's list, an IP literal in private space, and a name that
+/// resolves to any private address. `resolve` is injectable so the post-resolve
+/// rule is testable without network access.
+async function integrationUrlAllowed(provider, rawUrl, { resolve } = {}) {
+  let u;
+  try { u = new URL(String(rawUrl)); } catch { return { ok: false, error: 'not a valid URL' }; }
+  if (u.protocol !== 'https:') {
+    return { ok: false, error: `must use https (got ${u.protocol.replace(':', '')})` };
+  }
+  const host = String(u.hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host) return { ok: false, error: 'URL has no host' };
+
+  const extra = (process.env.NEUROSPLOIT_INTEGRATION_HOSTS || '')
+    .split(',').map((h) => h.trim().toLowerCase()).filter((h) => h && h !== '*');
+  const literal = /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':');
+
+  if (literal && isPrivateAddress(host)) {
+    return { ok: false, error: `${host} is a private address` };
+  }
+  if (!hostInList(host, (INTEGRATION_HOSTS[provider] || []).concat(extra))) {
+    return { ok: false, error: `host ${host} is not allowed for ${provider}` };
+  }
+  if (!literal) {
+    const lookup = resolve || ((h) => require('node:dns').promises.lookup(h, { all: true }));
+    let addrs;
+    try { addrs = await lookup(host); } catch { return { ok: false, error: `cannot resolve ${host}` }; }
+    const list = Array.isArray(addrs) ? addrs : [addrs];
+    if (!list.length) return { ok: false, error: `cannot resolve ${host}` };
+    for (const a of list) {
+      const ip = typeof a === 'string' ? a : a && a.address;
+      if (isPrivateAddress(ip)) return { ok: false, error: `${host} resolves to a private address` };
+    }
+  }
+  return { ok: true, value: u.origin };
+}
+
+// ---------------------------------------------------------------------------
 // Providers — mirrors crates/harness/src/models.rs `providers()`. Kept as a
 // literal table (not parsed from CLI output) so `kind` ("cli" = usable via a
 // locally-installed agentic CLI subscription login, "api" = key-only) and
@@ -439,7 +515,9 @@ async function validateIntegration(id, cfg) {
       const token = cfg.token || cfg.pat || '';
       const url = cfg.url || 'https://gitlab.com';
       if (!token) return { ok: false, message: 'Token is required' };
-      const r = await fetch(`${url.replace(/\/$/, '')}/api/v4/user`, { headers: { 'PRIVATE-TOKEN': token, Accept: 'application/json' } });
+      const gate = await integrationUrlAllowed('gitlab', url);
+      if (!gate.ok) return { ok: false, message: `URL policy: ${gate.error}` };
+      const r = await fetch(`${gate.value}/api/v4/user`, { headers: { 'PRIVATE-TOKEN': token, Accept: 'application/json' } });
       if (r.status === 200) { const u = JSON.parse(r.body); return { ok: true, message: `Authenticated as ${u.username}` }; }
       if (r.status === 401) return { ok: false, message: 'Invalid token — 401 Unauthorized' };
       return { ok: false, message: `GitLab returned ${r.status}` };
@@ -449,7 +527,9 @@ async function validateIntegration(id, cfg) {
       const email = cfg.email || '';
       const token = cfg.token || cfg.apitoken || '';
       if (!domain || !email || !token) return { ok: false, message: 'Domain, email and API token are required' };
-      const base = domain.startsWith('http') ? domain.replace(/\/$/, '') : `https://${domain}`;
+      const gate = await integrationUrlAllowed('jira', domain.startsWith('http') ? domain : `https://${domain}`);
+      if (!gate.ok) return { ok: false, message: `URL policy: ${gate.error}` };
+      const base = gate.value;
       const auth = Buffer.from(`${email}:${token}`).toString('base64');
       const r = await fetch(`${base}/rest/api/3/myself`, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' } });
       if (r.status === 200) { const u = JSON.parse(r.body); return { ok: true, message: `Authenticated as ${u.displayName || u.emailAddress}` }; }
@@ -2480,6 +2560,7 @@ module.exports = {
   startServer, bindAddress, bindBanner, isLoopback, metaPayload,
   buildArgs, buildReplScript, authArgs,
   MODE_ALLOWLIST, checkPositional, safeReplValue, confinePath, resolveRunDir,
+  isPrivateAddress, integrationUrlAllowed, validateIntegration,
   materializeCreds, cleanupJobTemp,
 };
 
