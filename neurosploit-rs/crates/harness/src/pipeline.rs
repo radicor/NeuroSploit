@@ -6220,13 +6220,17 @@ mod recon_shell_tests {
 
         // The child must be gone shortly after the future is dropped; poll rather
         // than checking once so a slow reaper is not mistaken for a survivor.
-        let mut survived = 0;
-        for _ in 0..25 {
-            if !child_matching(&token) { break; }
-            survived += 1;
-            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        // Wait *up to* 3 s for the child to disappear, then assert it did.
+        // The previous form counted every alive poll and required zero, which meant
+        // the child had to be reaped before the FIRST poll — so the window length
+        // was irrelevant and a slow reaper failed no matter how long it waited.
+        // That was the flake (SEC-016 A12), not a budget that was merely too short.
+        let mut gone = false;
+        for _ in 0..60 {
+            if !child_matching(&token) { gone = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert_eq!(survived, 0, "recon child still alive after cancel (token {token})");
+        assert!(gone, "recon child still alive after cancel (token {token})");
     }
 
     /// True when any live process's argv contains `token`. Reads `/proc` on

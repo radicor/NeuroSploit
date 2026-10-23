@@ -161,7 +161,12 @@ fi
 if [ "$installed" != "1" ]; then
   # ---- build from source (needs git + Rust) ----
   command -v git >/dev/null 2>&1 || die "git is required to build from source."
-  if ! command -v cargo >/dev/null 2>&1; then [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env" || true; fi
+  if ! command -v cargo >/dev/null 2>&1; then
+    if [ -f "$HOME/.cargo/env" ]; then
+      # shellcheck source=/dev/null
+      . "$HOME/.cargo/env"
+    fi
+  fi
   if ! command -v cargo >/dev/null 2>&1; then
     say "Rust not found — installing rustup (stable, minimal)…"
     RUSTUP_TMP="$(mktemp -d)"
@@ -177,6 +182,7 @@ if [ "$installed" != "1" ]; then
     fi
     sh "$RUSTUP_TMP/rustup.sh" -y --default-toolchain stable --profile minimal
     rm -rf "$RUSTUP_TMP"
+    # shellcheck source=/dev/null
     . "$HOME/.cargo/env"
   fi
   ok "Rust: $(cargo --version)"
@@ -269,20 +275,26 @@ if [ "${NEUROSPLOIT_NO_DEPS:-0}" != "1" ]; then
   for t in curl git nmap node; do
     if command -v "$t" >/dev/null 2>&1; then ok "$t present"; else
       warn "$t missing — installing…"; pkg_install "$(pkg_name "$t")"
-      command -v "$t" >/dev/null 2>&1 && ok "$t installed" || warn "could not install $t automatically — install it manually"
+      if command -v "$t" >/dev/null 2>&1; then ok "$t installed"; else warn "could not install $t automatically — install it manually"; fi
     fi
   done
   # Rust-cargo extras + report engine: install via cargo when present (no root).
   if command -v cargo >/dev/null 2>&1; then
-    command -v rustscan >/dev/null 2>&1 || { say "installing rustscan (cargo)…"; cargo install rustscan >/dev/null 2>&1 && ok "rustscan installed" || warn "rustscan optional — skipped"; }
-    command -v typst    >/dev/null 2>&1 || { say "installing typst (cargo)…";    cargo install typst-cli >/dev/null 2>&1 && ok "typst installed"    || warn "typst optional (PDF reports) — skipped"; }
+    if ! command -v rustscan >/dev/null 2>&1; then
+      say "installing rustscan (cargo)…"
+      if cargo install rustscan >/dev/null 2>&1; then ok "rustscan installed"; else warn "rustscan optional — skipped"; fi
+    fi
+    if ! command -v typst >/dev/null 2>&1; then
+      say "installing typst (cargo)…"
+      if cargo install typst-cli >/dev/null 2>&1; then ok "typst installed"; else warn "typst optional (PDF reports) — skipped"; fi
+    fi
   fi
   # ffuf is Go; only hint it.
-  command -v ffuf >/dev/null 2>&1 && ok "ffuf present" || warn "ffuf optional (fuzzing) — install via your package manager or Go"
+  if command -v ffuf >/dev/null 2>&1; then ok "ffuf present"; else warn "ffuf optional (fuzzing) — install via your package manager or Go"; fi
 else
   say "Dependency auto-install skipped (NEUROSPLOIT_NO_DEPS=1)."
   for t in curl git nmap node rustscan ffuf typst; do
-    command -v "$t" >/dev/null 2>&1 && ok "$t present" || warn "$t missing"
+    if command -v "$t" >/dev/null 2>&1; then ok "$t present"; else warn "$t missing"; fi
   done
 fi
 

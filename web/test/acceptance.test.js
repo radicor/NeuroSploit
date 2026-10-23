@@ -7,6 +7,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const http = require('node:http');
+const os = require('node:os');
 const path = require('node:path');
 
 const {
@@ -64,6 +65,25 @@ function rawRequest(port, { method = 'GET', path: p = '/', headers = {}, body } 
     if (body) req.write(body);
     req.end();
   });
+}
+
+/// Parse `- id:` / `status:` pairs out of the manifest without a YAML dependency
+/// (the suite is dependency-free by design). Returns null when the file is absent:
+/// `.agents/` is gitignored, so a clone legitimately has no manifest.
+function ownerStatuses(manifestPath) {
+  let text;
+  try {
+    text = fs.readFileSync(manifestPath, 'utf8');
+  } catch {
+    return null;
+  }
+  const out = [];
+  for (const chunk of text.split('\n  - id: ').slice(1)) {
+    const id = chunk.slice(0, Math.max(0, chunk.search(/\s/)));
+    const sm = /\n    status: (\S+)/.exec(chunk);
+    if (id && sm) out.push({ owner: id, status: sm[1] });
+  }
+  return out;
 }
 
 test('the checklist has twelve entries with ids, findings and owners (criteria 13, 14)', () => {
@@ -261,6 +281,55 @@ test('A11 — a torn save costs at most the last write (H13, web half)', async (
       for (const f of [file, `${file}.bak`]) { try { fs.rmSync(f, { force: true }); } catch { /* gone */ } }
     }
   });
+});
+
+/// The check itself, injectable so a fixture can drive it (the production path is
+/// the same function, with the same default argument).
+function checkOwners(manifestPath) {
+  const statuses = ownerStatuses(manifestPath);
+  if (!statuses) return { skipped: true, bad: [], reason: `${manifestPath} absent` };
+  const byId = new Map(statuses.map((s) => [s.owner, s.status]));
+  const bad = acceptanceReport()
+    .filter((r) => byId.get(r.owner) !== 'approved')
+    .map((r) => `${r.owner} (${r.id}) is ${byId.get(r.owner) || 'missing'}`);
+  return { skipped: false, bad };
+}
+
+test('every checklist owner is approved in the manifest (criterion 13)', (t) => {
+  const res = checkOwners(path.join(ROOT, '.agents', 'manifest.yml'));
+  if (res.skipped) {
+    // Never a silent pass and never a hard failure: `.agents/` is gitignored by
+    // design, so a clone owes the operator a loud statement that this did not run.
+    t.skip(`${res.reason} (gitignored; clone) — owner status not verified`);
+    return;
+  }
+  assert.strictEqual(res.bad.length, 0, `owner(s) not approved: ${res.bad.join(', ')}`);
+});
+
+test('the owner check fails naming an owner that is not approved (criterion 3)', () => {
+  const fixture = path.join(os.tmpdir(), `ns-owners-${process.pid}.yml`);
+  // SEC-001 owns A1; mark it planned and leave the rest out
+  fs.writeFileSync(fixture, 'specs:\n  - id: SEC-001\n    title: x\n    status: planned\n');
+  try {
+    const res = checkOwners(fixture);
+    assert.strictEqual(res.skipped, false);
+    assert.ok(res.bad.some((b) => b.startsWith('SEC-001 (A1) is planned')),
+      `the failure must name the owner and its status, got ${JSON.stringify(res.bad)}`);
+  } finally {
+    fs.rmSync(fixture, { force: true });
+  }
+});
+
+test('the owner check parses a manifest and names a non-approved owner (criterion 3)', () => {
+  const fixture = path.join(os.tmpdir(), `ns-manifest-${process.pid}.yml`);
+  fs.writeFileSync(fixture, 'specs:\n  - id: SEC-001\n    title: x\n    status: planned\n');
+  try {
+    assert.deepStrictEqual(ownerStatuses(fixture), [{ owner: 'SEC-001', status: 'planned' }]);
+    assert.strictEqual(ownerStatuses(path.join(os.tmpdir(), 'ns-does-not-exist.yml')), null,
+      'an absent manifest must return null so the caller can skip loudly');
+  } finally {
+    fs.rmSync(fixture, { force: true });
+  }
 });
 
 test('the confirmation interlock still demands the exact phrase (C3, SEC-007b)', () => {
