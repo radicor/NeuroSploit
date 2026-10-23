@@ -59,8 +59,13 @@ pub struct Capability {
     /// Ceiling on `effective_risk` (see [`crate::policy::Risk`]).
     pub max_risk: f64,
     /// Unix seconds. A grant without an end is not a grant, it is a standing
-    /// permission nobody remembers issuing.
+    /// permission nobody remembers issuing — which is why `issue` fills this in
+    /// and `verify` refuses a zero.
     pub expires_at: u64,
+    /// Unique id for this grant, so a token presented twice inside its window
+    /// is recognisable as a replay rather than a fresh authorization.
+    #[serde(default)]
+    pub jti: String,
     #[serde(default)]
     pub not_before: u64,
     /// Free-text reference (engagement id, statement of work, ticket).
@@ -74,6 +79,11 @@ pub enum TokenError {
     BadSignature,
     Expired { expired_at: u64, now: u64 },
     NotYetValid { starts_at: u64, now: u64 },
+    /// `expires_at == 0`. Distinct from `Expired` on purpose: "this grant has
+    /// no end" and "this grant ended" are different mistakes, and a caller that
+    /// collapses them cannot tell an old token from a malformed one.
+    MissingExpiry,
+    ExpiryTooFar { expires_at: u64, now: u64 },
 }
 
 impl std::fmt::Display for TokenError {
@@ -83,9 +93,16 @@ impl std::fmt::Display for TokenError {
             TokenError::BadSignature => write!(f, "capability token signature does not verify — it was not issued by the holder of this key, or it was altered"),
             TokenError::Expired { expired_at, now } => write!(f, "capability token expired {}s ago", now.saturating_sub(*expired_at)),
             TokenError::NotYetValid { starts_at, now } => write!(f, "capability token is not valid for another {}s", starts_at.saturating_sub(*now)),
+            TokenError::MissingExpiry => write!(f, "capability token has no expiry — a grant without an end is not a grant"),
+            TokenError::ExpiryTooFar { expires_at, now } => write!(f, "capability token expires {}s from now, beyond the {}h ceiling", expires_at.saturating_sub(*now), MAX_TTL_SECS / 3600),
         }
     }
 }
+
+/// The longest grant this build will honour. An engagement longer than three
+/// days needs a fresh token, not a longer one: a stolen week-long token is a
+/// week of access with nothing to renew.
+pub const MAX_TTL_SECS: u64 = 72 * 3600;
 
 fn now() -> u64 {
     std::time::SystemTime::now()
@@ -98,10 +115,70 @@ fn b64() -> base64::engine::general_purpose::GeneralPurpose {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
 }
 
+fn new_jti() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if f.read_exact(&mut buf).is_ok() {
+            return buf.iter().map(|b| format!("{b:02x}")).collect();
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:x}{:x}", std::process::id())
+}
+
+/// Remembers the `jti` of every token seen inside its window, so the same token
+/// presented twice is refused. Entries are dropped once their grant expires, so
+/// the set is bounded by the grants in flight rather than by uptime.
+#[derive(Debug, Default)]
+pub struct ReplaySet {
+    seen: std::collections::HashMap<String, u64>,
+}
+
+impl ReplaySet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// True the first time a token is seen, false on a replay. A token with no
+    /// `jti` cannot be tracked, so it is refused rather than silently admitted.
+    pub fn admit(&mut self, cap: &Capability, now: u64) -> bool {
+        self.seen.retain(|_, expires| *expires > now);
+        if cap.jti.trim().is_empty() {
+            return false;
+        }
+        if self.seen.contains_key(&cap.jti) {
+            return false;
+        }
+        self.seen.insert(cap.jti.clone(), cap.expires_at);
+        true
+    }
+
+    /// `admit` against the wall clock, for callers that do not thread a time.
+    pub fn admit_now(&mut self, cap: &Capability) -> bool {
+        self.admit(cap, now())
+    }
+
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+}
+
 impl Capability {
     /// Sign this grant with the issuer's key.
     pub fn issue(&self, key: &[u8]) -> String {
-        let payload = serde_json::to_vec(self).unwrap_or_default();
+        let mut cap = self.clone();
+        if cap.jti.trim().is_empty() {
+            cap.jti = new_jti();
+        }
+        let payload = serde_json::to_vec(&cap).unwrap_or_default();
         let body = b64().encode(&payload);
         let sig = sign(key, body.as_bytes());
         format!("{PREFIX}{body}.{}", b64().encode(sig))
@@ -126,8 +203,14 @@ impl Capability {
         if cap.not_before > 0 && t < cap.not_before {
             return Err(TokenError::NotYetValid { starts_at: cap.not_before, now: t });
         }
-        if cap.expires_at > 0 && t > cap.expires_at {
+        if cap.expires_at == 0 {
+            return Err(TokenError::MissingExpiry);
+        }
+        if t > cap.expires_at {
             return Err(TokenError::Expired { expired_at: cap.expires_at, now: t });
+        }
+        if cap.expires_at > t.saturating_add(MAX_TTL_SECS) {
+            return Err(TokenError::ExpiryTooFar { expires_at: cap.expires_at, now: t });
         }
         Ok(cap)
     }
@@ -279,6 +362,7 @@ mod tests {
             max_action: ActionKind::ProbeExploit,
             max_risk: 3.5,
             expires_at: now() + 3600,
+            jti: String::new(),
             not_before: 0,
             reference: "SOW-2026-14".into(),
         }
@@ -288,7 +372,78 @@ mod tests {
     fn a_token_round_trips_and_verifies() {
         let t = cap().issue(b"secret-key");
         let back = Capability::verify(&t, b"secret-key").expect("must verify");
-        assert_eq!(back, cap());
+        // `issue` mints a `jti` when the grant carries none, so the round trip
+        // differs by exactly that field: the claims must still be identical.
+        assert_eq!(
+            back.jti.len(),
+            32,
+            "issue must mint a 128-bit jti, got {:?}",
+            back.jti
+        );
+        let mut expected = cap();
+        expected.jti = back.jti.clone();
+        assert_eq!(back, expected);
+        assert_eq!(
+            Capability::verify(&t, b"secret-key").unwrap().jti,
+            expected.jti,
+            "the minted id must travel with the token, not be regenerated on read"
+        );
+    }
+
+    #[test]
+    fn a_grant_with_no_expiry_is_refused_with_its_own_error() {
+        // "never expires" and "expiry missing" are different mistakes; a caller
+        // that collapses them cannot tell an old token from a malformed one.
+        let mut c = cap();
+        c.expires_at = 0;
+        let t = c.issue(b"secret-key");
+        assert_eq!(
+            Capability::verify(&t, b"secret-key").unwrap_err(),
+            TokenError::MissingExpiry
+        );
+    }
+
+    #[test]
+    fn a_grant_beyond_the_ceiling_is_refused() {
+        let mut c = cap();
+        c.expires_at = now() + MAX_TTL_SECS + 3600;
+        let t = c.issue(b"secret-key");
+        assert!(matches!(
+            Capability::verify(&t, b"secret-key").unwrap_err(),
+            TokenError::ExpiryTooFar { .. }
+        ));
+    }
+
+    #[test]
+    fn a_token_presented_twice_is_a_replay_and_the_set_stays_bounded() {
+        let mut set = ReplaySet::new();
+        // A token as `issue` would produce it: the fixture's empty jti is
+        // deliberately untrackable and is tested separately below.
+        let mut c = cap();
+        c.jti = "minted-jti-1".into();
+        assert!(set.admit(&c, now()), "the first presentation is authorized");
+        assert!(!set.admit(&c, now()), "the second is a replay");
+        assert_eq!(set.len(), 1);
+
+        // A grant seen after the first one has expired evicts it, so the set
+        // tracks grants in flight rather than growing with uptime.
+        let mut later = cap();
+        later.jti = "later-jti".into();
+        let at = c.expires_at + 1;
+        later.expires_at = at + 3600;
+        assert!(set.admit(&later, at));
+        assert_eq!(
+            set.len(),
+            1,
+            "the expired entry must be evicted, leaving only the new grant"
+        );
+
+        let mut untracked = cap();
+        untracked.jti = String::new();
+        assert!(
+            !set.admit(&untracked, at),
+            "a token with no jti cannot be tracked and is refused"
+        );
     }
 
     #[test]

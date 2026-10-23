@@ -100,14 +100,17 @@ pub fn http_client() -> reqwest::Client {
 }
 
 fn client() -> reqwest::Client {
-    client_for(None)
+    client_for(None, false)
 }
 
 /// A client whose redirects are judged by `policy`. The in-scope probe uses
 /// this, so a 302 off the authorized surface is returned as data rather than
 /// followed — and a hostname pointing at loopback is stopped before it resolves.
-fn client_for(policy: Option<std::sync::Arc<crate::scope::ScopePolicy>>) -> reqwest::Client {
-    let mut b = base_builder_for(policy);
+fn client_for(
+    policy: Option<std::sync::Arc<crate::scope::ScopePolicy>>,
+    insecure: bool,
+) -> reqwest::Client {
+    let mut b = base_builder_for(policy, insecure);
     if let Some(p) = proxy_url(&std::env::var("NEUROSPLOIT_PROXY").unwrap_or_default()) {
         if let Ok(px) = reqwest::Proxy::all(p) { b = b.proxy(px); }
     }
@@ -116,11 +119,12 @@ fn client_for(policy: Option<std::sync::Arc<crate::scope::ScopePolicy>>) -> reqw
 
 /// Everything both clients share: UA, timeout, redirect guard, scan headers.
 fn base_builder() -> reqwest::ClientBuilder {
-    base_builder_for(None)
+    base_builder_for(None, false)
 }
 
 fn base_builder_for(
     policy: Option<std::sync::Arc<crate::scope::ScopePolicy>>,
+    insecure: bool,
 ) -> reqwest::ClientBuilder {
     let ua = std::env::var("NEUROSPLOIT_UA").ok().filter(|v| !v.trim().is_empty())
         .unwrap_or_else(crate::pipeline::default_user_agent);
@@ -173,7 +177,7 @@ fn base_builder_for(
     });
     reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(insecure)
         .redirect(redirect)
         .default_headers(crate::pipeline::default_scan_headers())
         .user_agent(ua)
@@ -345,7 +349,20 @@ fn with_auth(rb: reqwest::RequestBuilder, auth: Option<(&str, &str)>) -> reqwest
 }
 
 pub async fn probe_in_scope(target: &str, policy: &crate::scope::ScopePolicy) -> Probe {
-    probe_in_scope_auth(target, policy, None).await
+    probe_in_scope_auth(target, policy, None, false).await
+}
+
+/// A reqwest error's Display is just "error sending request"; the reason lives
+/// in the source chain. An operator reading the notes needs "certificate" or
+/// "connection refused", not a shrug.
+fn describe_error(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(src) = cur {
+        out.push_str(&format!(": {src}"));
+        cur = src.source();
+    }
+    out
 }
 
 /// As `probe_in_scope`, with a resolved credential attached to every request.
@@ -353,6 +370,7 @@ pub async fn probe_in_scope_auth(
     target: &str,
     policy: &crate::scope::ScopePolicy,
     auth: Option<(&str, &str)>,
+    insecure: bool,
 ) -> Probe {
     let d = policy.check(target, crate::scope::Action::Probe);
     if !d.allowed() {
@@ -362,11 +380,11 @@ pub async fn probe_in_scope_auth(
     }
     let policy = std::sync::Arc::new(policy.clone());
     if let crate::scope::Decision::Warn(w) = d {
-        let mut p = probe_auth_with_policy(target, auth, Some(policy)).await;
+        let mut p = probe_auth_with_policy(target, auth, Some(policy), insecure).await;
         p.notes.push(format!("scope guard: {w}"));
         return p;
     }
-    probe_auth_with_policy(target, auth, Some(policy)).await
+    probe_auth_with_policy(target, auth, Some(policy), insecure).await
 }
 
 pub async fn probe(target: &str) -> Probe {
@@ -374,7 +392,7 @@ pub async fn probe(target: &str) -> Probe {
 }
 
 pub async fn probe_auth(target: &str, auth: Option<(&str, &str)>) -> Probe {
-    probe_auth_with_policy(target, auth, None).await
+    probe_auth_with_policy(target, auth, None, false).await
 }
 
 /// As `probe_auth`, but redirects are judged by `policy`. `probe_in_scope_auth`
@@ -384,13 +402,14 @@ pub async fn probe_auth_with_policy(
     target: &str,
     auth: Option<(&str, &str)>,
     policy: Option<std::sync::Arc<crate::scope::ScopePolicy>>,
+    insecure: bool,
 ) -> Probe {
     let mut p = Probe { url: target.to_string(), ..Default::default() };
-    let c = client_for(policy);
+    let c = client_for(policy, insecure);
 
     let resp = match with_auth(c.get(target), auth).send().await {
         Ok(r) => r,
-        Err(e) => { p.notes.push(format!("initial GET failed: {e}")); return p; }
+        Err(e) => { p.notes.push(format!("initial GET failed: {}", describe_error(&e))); return p; }
     };
     p.final_url = resp.url().to_string();
     p.redirected = p.final_url.trim_end_matches('/') != target.trim_end_matches('/');
@@ -692,7 +711,7 @@ mod redirect_scope_tests {
             .hard
             .push(crate::scope::Pattern::parse("localhost").expect("pattern"));
 
-        let p = probe_in_scope_auth(&format!("http://127.0.0.1:{origin_port}/"), &policy, None).await;
+        let p = probe_in_scope_auth(&format!("http://127.0.0.1:{origin_port}/"), &policy, None, false).await;
         assert_eq!(p.status, 302, "the redirect must come back as data, notes: {:?}", p.notes);
 
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -702,6 +721,89 @@ mod redirect_scope_tests {
             "the client followed the redirect: {} request(s) for /moved reached the canary ({} unrelated connection(s) also seen)",
             redirected.load(Ordering::SeqCst),
             other.load(Ordering::SeqCst)
+        );
+    }
+}
+#[cfg(test)]
+mod tls_handshake_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A loopback TLS origin whose certificate is generated at test time: no
+    /// openssl, no fixture file, no external binary.
+    async fn self_signed_origin() -> u16 {
+        // rustls 0.23 requires a process-wide crypto provider; the test installs
+        // it itself so it does not depend on another test having done so.
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate a self-signed certificate");
+        let cert_der = ck.cert.der().clone();
+        let key_der = ck.signing_key.serialize_der();
+        let config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert_der],
+                tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(key_der.into()),
+            )
+            .expect("server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // Bounded accept loop, so "the handshake was refused" cannot be
+            // confused with "nothing was ever listening".
+            for _ in 0..8 {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await {
+                    Ok(Ok((sock, _))) => {
+                        let acc = acceptor.clone();
+                        tokio::spawn(async move {
+                            if let Ok(mut tls) = acc.accept(sock).await {
+                                let mut b = [0u8; 2048];
+                                let _ = tls.read(&mut b).await;
+                                let _ = tls
+                                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                                    .await;
+                            }
+                        });
+                    }
+                    _ => break,
+                }
+            }
+        });
+        port
+    }
+
+    /// Criterion 1, wire half: the spec's own example — default fails with a
+    /// certificate error, `--insecure` succeeds against the same target.
+    #[tokio::test]
+    async fn a_self_signed_target_is_refused_by_default_and_accepted_with_insecure() {
+        let port = self_signed_origin().await;
+        let target = format!("https://localhost:{port}/");
+
+        let strict = probe_auth_with_policy(&target, None, None, false).await;
+        assert_eq!(
+            strict.status, 0,
+            "the default must not complete a request to a self-signed host: {:?}",
+            strict.notes
+        );
+        let note = strict.notes.join(" | ").to_lowercase();
+        assert!(
+            note.contains("cert"),
+            "the refusal must name the certificate, not a timeout: {:?}",
+            strict.notes
+        );
+        assert!(
+            !note.contains("connection refused"),
+            "the origin must be listening, so a refusal is about TLS and not reachability: {:?}",
+            strict.notes
+        );
+
+        let loose = probe_auth_with_policy(&target, None, None, true).await;
+        assert_eq!(
+            loose.status, 200,
+            "--insecure must complete the handshake against the same target: {:?}",
+            loose.notes
         );
     }
 }

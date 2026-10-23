@@ -194,6 +194,36 @@ impl Completer for NsHelper {
     }
 }
 
+/// The REPL's per-process replay ledger. A token accepted once cannot be
+/// accepted again in this process. Cross-process detection needs durable state;
+/// that is SEC-011's ledger domain, so the guarantee is "no replay within a
+/// verifier process", not a global one.
+fn replay_set() -> &'static std::sync::Mutex<harness::capability::ReplaySet> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<harness::capability::ReplaySet>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| std::sync::Mutex::new(harness::capability::ReplaySet::new()))
+}
+
+/// Verify a capability and admit it for *use*.
+///
+/// Inspection paths (`/capability` with no argument) must not call this: spending
+/// a token's replay slot while only displaying it would make the real acceptance
+/// look like a replay. The refusal uses the same -32001 class as the MCP gate so
+/// there is one refusal vocabulary.
+fn accept_capability(
+    token: &str,
+    key: &[u8],
+) -> Result<harness::capability::Capability, String> {
+    let cap = harness::capability::Capability::verify(token, key).map_err(|e| e.to_string())?;
+    let mut set = replay_set()
+        .lock()
+        .map_err(|_| "the capability replay ledger is poisoned".to_string())?;
+    if !set.admit_now(&cap) {
+        return Err("-32001 unauthorized: this capability token has already been accepted in this process (replay)".into());
+    }
+    Ok(cap)
+}
+
 fn complete_path(prefix: &str) -> Vec<Pair> {
     let (dir, frag) = match prefix.rfind('/') {
         Some(i) => (&prefix[..=i], &prefix[i + 1..]),
@@ -516,7 +546,7 @@ pub async fn repl(base: &Path, auth: SessionAuth) -> anyhow::Result<()> {
     if let Some(token) = auth.capability.as_deref() {
         match harness::capability::key_from_env() {
             None => println!("  \x1b[31m⛔ a capability token was supplied but no verification key is configured\x1b[0m — set NEUROSPLOIT_CAPABILITY_KEY. Not applied."),
-            Some(k) => match harness::capability::Capability::verify(token, &k) {
+            Some(k) => match accept_capability(token, &k) {
                 Ok(c) => {
                     let (effective, dropped) = c.constrain(&s.policy);
                     s.policy = effective;
@@ -1581,7 +1611,7 @@ pub async fn repl(base: &Path, auth: SessionAuth) -> anyhow::Result<()> {
                     let token = arg.trim().to_string();
                     match harness::capability::key_from_env() {
                         None => println!("  \x1b[31m⛔ no verification key\x1b[0m — set NEUROSPLOIT_CAPABILITY_KEY (or _KEY_FILE). An unverifiable token is not authorization; not stored."),
-                        Some(k) => match harness::capability::Capability::verify(&token, &k) {
+                        Some(k) => match accept_capability(&token, &k) {
                             Ok(c) => {
                                 let (effective, dropped) = c.constrain(&s.policy);
                                 if !dropped.is_empty() {
@@ -3323,5 +3353,55 @@ mod nl_tests {
                 "{c} must reach the dispatch as typed"
             );
         }
+    }
+}
+#[cfg(test)]
+mod capability_gate_tests {
+    use super::*;
+
+    fn token(jti: &str) -> (String, &'static [u8]) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let cap = harness::capability::Capability {
+            id: "cap-gate".into(),
+            issuer: "issuer".into(),
+            subject: "subject".into(),
+            scope: vec!["example.com".into()],
+            exclude: vec![],
+            environment: harness::policy::Environment::Production,
+            max_action: harness::policy::ActionKind::ProbeExploit,
+            max_risk: 1.0,
+            expires_at: now + 600,
+            jti: jti.into(),
+            not_before: 0,
+            reference: String::new(),
+        };
+        (cap.issue(b"gate-key"), b"gate-key" as &[u8])
+    }
+
+    #[test]
+    fn a_capability_cannot_be_accepted_twice_in_one_process() {
+        let (t, k) = token("gate-jti-1");
+        assert!(accept_capability(&t, k).is_ok(), "the first acceptance must succeed");
+        let err = accept_capability(&t, k).unwrap_err();
+        assert!(
+            err.contains("-32001"),
+            "the refusal must carry the shared code, got: {err}"
+        );
+        assert!(err.contains("replay"), "{err}");
+    }
+
+    #[test]
+    fn inspecting_a_token_does_not_spend_its_slot() {
+        // The display path verifies without admitting. If it consumed the slot,
+        // the operator's next real acceptance would look like a replay.
+        let (t, k) = token("gate-jti-2");
+        assert!(harness::capability::Capability::verify(&t, k).is_ok());
+        assert!(
+            accept_capability(&t, k).is_ok(),
+            "inspecting a token must not spend its replay slot"
+        );
     }
 }

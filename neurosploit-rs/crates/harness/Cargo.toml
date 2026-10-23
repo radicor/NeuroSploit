@@ -21,3 +21,7 @@ sha2 = "0.10"
 hmac = "0.12"
 base64 = "0.22"
 regex = "1"
+
+[dev-dependencies]
+rcgen = "0.14.10"
+tokio-rustls = "0.26.6"

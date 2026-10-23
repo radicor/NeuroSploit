@@ -195,6 +195,11 @@ pub struct RunConfig {
     /// policy-checked and the choke always starts. `yolo` is explicit.
     #[serde(default)]
     pub execution_mode: ExecutionMode,
+    /// Accept invalid TLS certificates for this run (SEC-013). Off by default: a
+    /// scan that trusts any certificate cannot tell its target from an impostor.
+    /// Turning it on is stated in the run's honesty block.
+    #[serde(default)]
+    pub insecure: bool,
     /// Operator secrets as slot references. Skipped on (de)serialisation: a
     /// config round-trip must never carry a value, and an absent field is empty.
     #[serde(skip)]
@@ -403,6 +408,7 @@ impl RunConfig {
         RunConfig {
             target: target.into(),
             execution_mode: ExecutionMode::Scoped,
+            insecure: false,
             vault: crate::vault::Vault::default(),
             models: vec!["anthropic:claude-opus-4-8".into()],
             vote_n: 3,

@@ -12,7 +12,7 @@ const path = require('node:path');
 
 const {
   MODE_ALLOWLIST, checkPositional, safeReplValue, confinePath, resolveRunDir,
-  buildArgs, buildReplScript, materializeCreds, cleanupJobTemp, modeFor, startServer,
+  buildArgs, buildReplScript, materializeCreds, cleanupJobTemp, modeFor, startServer, keyProbe,
 } = require('../server.js');
 
 const is400 = (field) => (e) => {
@@ -210,4 +210,19 @@ test('POST /api/exploit refuses a forged mode before any job exists', async () =
     assert.strictEqual(iso.status, 400, 'isolated must be refused, never accepted-and-ignored');
     assert.match((await iso.json()).error, /v4\.6/);
   } finally { await srv.close(); }
+});
+
+test('the Gemini key travels in a header, never the URL (SEC-013 M7)', () => {
+  const probe = keyProbe('gemini', 'AIza-test-key');
+  assert.ok(probe, 'gemini must be verifiable from the console');
+  assert.ok(
+    !/[?&]key=/.test(probe.url),
+    `the key must not be in the URL — proxy logs and Referer headers see it: ${probe.url}`,
+  );
+  assert.strictEqual(probe.headers['x-goog-api-key'], 'AIza-test-key');
+  assert.match(
+    probe.url,
+    /^https:\/\/generativelanguage\.googleapis\.com\//,
+    'the host must not move: SEC-013a\'s allowlist was written against it',
+  );
 });

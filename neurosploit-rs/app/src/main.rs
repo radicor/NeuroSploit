@@ -79,6 +79,10 @@ struct Cli {
     /// turns the scope promise off). Global, so a session cannot farm itself.
     #[arg(long = "execution-mode", global = true)]
     execution_mode: Option<String>,
+    /// Accept invalid TLS certificates for this run. Off by default; turning it
+    /// on is printed in the run's honesty block. Global.
+    #[arg(long = "insecure", global = true)]
+    insecure: bool,
     /// Run agent commands inside a container instead of on the host. Bare flag
     /// uses the Kali image; give a value to override (e.g. --sandbox my/img).
     #[arg(long = "sandbox", global = true, num_args = 0..=1, default_missing_value = "")]
@@ -2177,6 +2181,7 @@ fn handle_capability(cmd: CapCmd) -> anyhow::Result<()> {
                 max_action: action,
                 max_risk,
                 expires_at: now + hours * 3600,
+                jti: String::new(),
                 not_before: 0,
                 reference,
             };
@@ -2310,6 +2315,9 @@ fn apply_network(cfg: &mut RunConfig, cli: &Cli) -> anyhow::Result<()> {
         }
         println!("  \x1b[2mexecution-mode: {}\x1b[0m", mode.as_str());
         cfg.execution_mode = mode;
+    }
+    if cli.insecure {
+        cfg.insecure = true;
     }
     Ok(())
 }

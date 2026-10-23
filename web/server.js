@@ -477,7 +477,9 @@ function keyProbe(provider, key) {
     case 'anthropic': return { url: 'https://api.anthropic.com/v1/models', headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' } };
     case 'openai': return { url: 'https://api.openai.com/v1/models', headers: bearer };
     case 'xai': return { url: 'https://api.x.ai/v1/models', headers: bearer };
-    case 'gemini': return { url: `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`, headers: {} };
+    // The key rides in a header: a query string lands in proxy logs, Referer
+    // headers and shell history, and this is a long-lived API key.
+    case 'gemini': return { url: 'https://generativelanguage.googleapis.com/v1beta/models', headers: { 'x-goog-api-key': key } };
     case 'deepseek': return { url: 'https://api.deepseek.com/models', headers: bearer };
     case 'mistral': return { url: 'https://api.mistral.ai/v1/models', headers: bearer };
     case 'groq': return { url: 'https://api.groq.com/openai/v1/models', headers: bearer };
@@ -3249,6 +3251,7 @@ module.exports = {
   securityHeaders, hostAllowed, originAllowed, enforceJsonType, rateLimit,
   REPL_COMMANDS, OPERATOR_COMMANDS, classifyStdinLine, gateStdin,
   idempotencyKey, bodyDigest, withIdempotency, duplicateLaunch, withConfigLock, pruneJobs, mutateConfig,
+  keyProbe,
   modeFor,
   tierFor, tierRuleFor, redactSecret, redactEntry, isMasked, unmaskOnWrite, requireConfirm, redactIntegration, redactVault, unmaskVault,
   materializeCreds, cleanupJobTemp,

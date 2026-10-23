@@ -37,6 +37,7 @@
 
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -45,6 +46,10 @@ pub fn serve() -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
     let exe = std::env::current_exe().unwrap_or_else(|_| "neurosploit".into());
+    // The token is established once per process. `tools/call` is refused
+    // without it; `initialize` and `tools/list` stay open so a client can
+    // discover what it is missing a credential for.
+    let auth = authorize_from_env();
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -66,7 +71,7 @@ pub fn serve() -> anyhow::Result<()> {
                 "serverInfo": { "name": "neurosploit", "version": env!("CARGO_PKG_VERSION") }
             }))),
             "tools/list" => Some(ok(id, json!({ "tools": tool_list() }))),
-            "tools/call" => Some(handle_call(id, &req, &exe)),
+            "tools/call" => Some(handle_call(id, &req, &exe, &auth)),
             "ping" => Some(ok(id, json!({}))),
             m if m.starts_with("notifications/") => None,
             _ if id.is_some() => Some(err(id, -32601, "method not found")),
@@ -339,7 +344,145 @@ fn tool_list() -> Value {
 // Tool dispatch
 // ---------------------------------------------------------------------------
 
-fn handle_call(id: Option<Value>, req: &Value, exe: &std::path::Path) -> Value {
+/// Constant-time comparison: a timing side channel on a local token is a small
+/// risk, but the cost of doing it right is four lines.
+fn token_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// 256 bits from the OS. The time+pid fallback is only for platforms without
+/// `/dev/urandom`; a token read from a file the same user can read is the real
+/// boundary, and that file is 0600.
+fn random_token() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 32];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if f.read_exact(&mut buf).is_ok() {
+            return hex(&buf);
+        }
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    hex(format!("{nanos}:{}", std::process::id()).as_bytes())
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) {}
+
+fn write_token(dir: &Path, token: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    set_mode(dir, 0o700);
+    let path = dir.join("mcp-token");
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&path)?;
+        f.write_all(token.as_bytes())?;
+    }
+    // `mode` on open only applies when the file is created; an existing file
+    // from an older version must be tightened too.
+    set_mode(&path, 0o600);
+    Ok(path)
+}
+
+/// Read the token, creating it on first use and printing it exactly once.
+fn load_or_create_token_at(dir: &Path) -> std::io::Result<String> {
+    let path = dir.join("mcp-token");
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let t = s.trim().to_string();
+        if !t.is_empty() {
+            // A token created by an older build, or by hand, may be readable by
+            // other users; tighten it on every start rather than only at
+            // creation.
+            set_mode(&path, 0o600);
+            return Ok(t);
+        }
+    }
+    let token = random_token();
+    write_token(dir, &token)?;
+    eprintln!(
+        "MCP: created {} (0600) — export NEUROSPLOIT_MCP_TOKEN with this value to use the server",
+        path.display()
+    );
+    Ok(token)
+}
+
+fn authorize_from_env() -> Result<(), String> {
+    let dir = std::env::current_dir()
+        .map_err(|e| format!("unauthorized: cannot locate working directory: {e}"))?
+        .join(".neurosploit");
+    let expected = load_or_create_token_at(&dir)
+        .map_err(|e| format!("unauthorized: cannot establish the MCP token: {e}"))?;
+    match std::env::var("NEUROSPLOIT_MCP_TOKEN") {
+        Ok(presented) if token_eq(presented.trim(), &expected) => Ok(()),
+        Ok(_) => Err(
+            "unauthorized: NEUROSPLOIT_MCP_TOKEN does not match .neurosploit/mcp-token".into(),
+        ),
+        Err(_) => Err(
+            "unauthorized: NEUROSPLOIT_MCP_TOKEN is not set; read the token from .neurosploit/mcp-token"
+                .into(),
+        ),
+    }
+}
+
+/// Resolve a `run` argument to a directory that is provably inside `runs/`.
+/// Checked on the canonical path: the raw string accepts `runs/../../etc` and a
+/// symlink out of the tree.
+fn confined_run_dir(runs: &Path, run: &str) -> Result<PathBuf, String> {
+    let base = std::fs::canonicalize(runs).unwrap_or_else(|_| runs.to_path_buf());
+    let candidate = if Path::new(run).is_dir() {
+        PathBuf::from(run)
+    } else {
+        base.join(run)
+    };
+    let canon = std::fs::canonicalize(&candidate)
+        .map_err(|_| format!("run `{run}` is not a directory under runs/"))?;
+    if !canon.starts_with(&base) {
+        return Err(format!("run `{run}` escapes runs/"));
+    }
+    Ok(canon)
+}
+
+fn handle_call(
+    id: Option<Value>,
+    req: &Value,
+    exe: &std::path::Path,
+    auth: &Result<(), String>,
+) -> Value {
+    // MCP here is stdio JSON-RPC, so there is no HTTP status to send: the
+    // refusal is an error response whose message names the missing credential.
+    if let Err(e) = auth {
+        return err(id, -32001, e);
+    }
     let params = req.get("params").cloned().unwrap_or(json!({}));
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let a = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -565,7 +708,11 @@ fn import_collection(id: Option<Value>, path: &str) -> Value {
 
 fn read_run_file(id: Option<Value>, run: &str, file: &str) -> Value {
     let base = std::env::current_dir().unwrap_or_default();
-    let dir = if std::path::Path::new(run).is_dir() { std::path::PathBuf::from(run) } else { base.join("runs").join(run) };
+    let runs = base.join("runs");
+    let dir = match confined_run_dir(&runs, run) {
+        Ok(d) => d,
+        Err(e) => return tool_err(id, &e),
+    };
     match std::fs::read_to_string(dir.join(file)) {
         Ok(s) => tool_text(id, &s),
         Err(e) => tool_err(id, &format!("cannot read {}/{file}: {e}", dir.display())),
@@ -601,4 +748,76 @@ fn strip_ansi(s: &str) -> String {
         out.push(c);
     }
     out
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ns-mcp-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_tool_call_without_authorization_is_refused_by_the_dispatcher() {
+        // TN-1: the gate must be read by the code that dispatches, not merely
+        // available as a helper next to it.
+        let req = json!({
+            "method": "tools/call",
+            "params": { "name": "neurosploit_status", "arguments": {} }
+        });
+        let refusal = Err("unauthorized: NEUROSPLOIT_MCP_TOKEN is not set".to_string());
+        let v = handle_call(Some(json!(1)), &req, Path::new("neurosploit"), &refusal);
+        assert_eq!(
+            v["error"]["code"], -32001,
+            "an unauthorized call must be refused with the auth error, got {v}"
+        );
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unauthorized"));
+    }
+
+    #[test]
+    fn tokens_compare_exactly_and_only_exactly() {
+        assert!(token_eq("abc123", "abc123"));
+        assert!(!token_eq("abc123", "abc124"));
+        assert!(!token_eq("abc123", "abc1234"));
+        assert!(!token_eq("", "abc"));
+    }
+
+    #[test]
+    fn a_run_path_that_escapes_runs_is_refused_and_one_inside_is_not() {
+        let base = tmp("confine");
+        let runs = base.join("runs");
+        std::fs::create_dir_all(runs.join("ok")).unwrap();
+        assert!(confined_run_dir(&runs, "ok").is_ok());
+        assert!(confined_run_dir(&runs, "/etc").is_err(), "an absolute path must be refused");
+        assert!(confined_run_dir(&runs, "../..").is_err(), "a traversal must be refused");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_token_file_is_private_at_creation_even_if_it_already_existed() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tmp("token");
+        let dir = base.join(".neurosploit");
+        let first = load_or_create_token_at(&dir).unwrap();
+        let path = dir.join("mcp-token");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a freshly created token must be 0600, got {mode:o}");
+        assert_eq!(
+            load_or_create_token_at(&dir).unwrap(),
+            first,
+            "a second start must reuse the token rather than minting a new one"
+        );
+        // An older file with looser bits is tightened on the next start.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        load_or_create_token_at(&dir).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "an existing token must be tightened, got {mode:o}");
+        std::fs::remove_dir_all(&base).ok();
+    }
 }

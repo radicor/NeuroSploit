@@ -183,6 +183,9 @@ fn operator_directives(cfg: &RunConfig) -> String {
     let has_scope = !cfg.scope.hard.is_empty() || !cfg.target.is_empty();
     if has_scope {
         s.push_str(authorization_preamble(cfg.execution_mode));
+        if cfg.insecure {
+            s.push_str("• TLS VERIFICATION IS OFF for this run (--insecure): certificate errors are ignored, so a hostile host can impersonate the target.\n");
+        }
     }
     if let Some(a) = cfg.authorization.as_deref().filter(|x| !x.trim().is_empty()) {
         s.push_str(&format!("PROGRAM REFERENCE: {a}\n"));
@@ -1030,7 +1033,7 @@ async fn authz_matrix_pass(cfg: &RunConfig, recon: &str, tx: &Sender<String>) ->
         creds.roles.len()
     )).await;
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(cfg.insecure)
         .timeout(std::time::Duration::from_secs(30))
         .default_headers(default_scan_headers())
         .user_agent(cfg.user_agent.clone().unwrap_or_else(default_user_agent))
@@ -1041,6 +1044,28 @@ async fn authz_matrix_pass(cfg: &RunConfig, recon: &str, tx: &Sender<String>) ->
         crate::authz_matrix::send_via(&client, m, u, h, b)
     })
     .await
+}
+
+/// The OOB listener's bind address, plus an exposure warning.
+///
+/// The warning follows the **resolved address**, not the flag: an explicit
+/// `--oob-bind 127.0.0.1:9000` is as private as the default and must stay
+/// silent, or operators learn to ignore the warning that matters.
+fn oob_bind(cfg: &RunConfig) -> (std::net::SocketAddr, Option<String>) {
+    let addr: std::net::SocketAddr = cfg
+        .oob_http
+        .as_deref()
+        .unwrap_or("127.0.0.1:8080")
+        .parse()
+        .unwrap_or_else(|_| "127.0.0.1:8080".parse().expect("loopback literal"));
+    let warn = if addr.ip().is_loopback() {
+        None
+    } else {
+        Some(format!(
+            "⚠ OOB listener exposed on {addr} — callbacks are reachable from other hosts"
+        ))
+    };
+    (addr, warn)
 }
 
 /// Start the egress choke (SEC-010 criteria 2–3).
@@ -1308,12 +1333,10 @@ pub async fn run(mut cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender
     // ever be leads — which the prompt says explicitly rather than letting an
     // agent assert a callback it had no way to receive.
     if let Some(domain) = cfg.oob_domain.as_deref().filter(|d| d.contains('.')) {
-        let http: std::net::SocketAddr = cfg
-            .oob_http
-            .as_deref()
-            .unwrap_or("0.0.0.0:8080")
-            .parse()
-            .unwrap_or_else(|_| "0.0.0.0:8080".parse().unwrap());
+        let (http, exposure) = oob_bind(&cfg);
+        if let Some(w) = exposure {
+            let _ = tx.send(format!("notify: {w}")).await;
+        }
         let dns = cfg.oob_dns.as_deref().and_then(|d| d.parse().ok());
         let collab = crate::oob::Collaborator::self_hosted(domain, http, dns);
         match collab.listen().await {
@@ -1430,6 +1453,7 @@ pub async fn run(mut cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender
             &cfg.target,
             &effective_scope(&cfg),
             pa.as_ref().map(|(k, v)| (k.as_str(), v.as_str())),
+            cfg.insecure,
         )
         .await;
         let _ = tx.send(crate::probe::probe_summary(&p)).await;
@@ -1902,6 +1926,7 @@ pub async fn run_greybox(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Se
             &cfg.target,
             &effective_scope(&cfg),
             pa.as_ref().map(|(k, v)| (k.as_str(), v.as_str())),
+            cfg.insecure,
         )
         .await;
         let _ = tx.send(crate::probe::probe_summary(&p)).await;
@@ -5418,7 +5443,7 @@ async fn enumerate_subdomains(cfg: &RunConfig, tx: &Sender<String>) -> String {
     let scope = effective_scope(cfg);
     let seed_host = crate::scope::host_of(&cfg.target);
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(cfg.insecure)
         .timeout(std::time::Duration::from_secs(30))
         .default_headers(default_scan_headers())
         .user_agent(cfg.user_agent.clone().unwrap_or_else(|| default_user_agent()))
@@ -5662,6 +5687,7 @@ pub async fn run_ai(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<
             &cfg.target,
             &effective_scope(&cfg),
             pa.as_ref().map(|(k, v)| (k.as_str(), v.as_str())),
+            cfg.insecure,
         )
         .await;
         let _ = tx.send(crate::probe::probe_summary(&p)).await;
@@ -6472,9 +6498,62 @@ mod preamble_mode_tests {
     }
 
     #[test]
+    fn the_tls_posture_is_off_by_default_and_loud_when_enabled() {
+        let cfg = RunConfig::new("https://app.example.com");
+        assert!(!cfg.insecure, "certificate verification must be the default");
+        assert!(
+            !operator_directives(&cfg).contains("TLS VERIFICATION IS OFF"),
+            "the default posture must not claim verification is off"
+        );
+
+        let mut loose = RunConfig::new("https://app.example.com");
+        loose.insecure = true;
+        let text = operator_directives(&loose);
+        assert!(
+            text.contains("TLS VERIFICATION IS OFF"),
+            "turning verification off must be stated in the honesty block: {text}"
+        );
+    }
+
+    #[test]
     fn the_scope_block_makes_the_same_claim_the_guard_does() {
         let block = crate::scope::ScopePolicy::for_target("https://app.example.com").prompt_block();
         assert!(!block.contains("every outbound request"));
         assert!(block.contains("in scope"));
+    }
+}
+#[cfg(test)]
+mod oob_bind_tests {
+    use super::*;
+
+    #[test]
+    fn the_default_bind_is_loopback_and_silent() {
+        let cfg = RunConfig::new("https://app.example.com");
+        let (addr, warn) = oob_bind(&cfg);
+        assert_eq!(addr.to_string(), "127.0.0.1:8080");
+        assert!(warn.is_none(), "the default must not warn");
+    }
+
+    #[test]
+    fn the_warning_follows_the_address_not_the_flag() {
+        let mut cfg = RunConfig::new("https://app.example.com");
+        cfg.oob_http = Some("0.0.0.0:8080".into());
+        let (_, warn) = oob_bind(&cfg);
+        assert!(warn.as_deref().unwrap_or("").contains("exposed"), "a public bind must warn");
+
+        // Explicitly loopback on a different port: still private, still silent.
+        cfg.oob_http = Some("127.0.0.1:9000".into());
+        let (addr, warn) = oob_bind(&cfg);
+        assert_eq!(addr.port(), 9000);
+        assert!(warn.is_none(), "an explicit loopback bind must stay silent");
+    }
+
+    #[test]
+    fn a_malformed_bind_falls_back_to_loopback_rather_than_exposing() {
+        let mut cfg = RunConfig::new("https://app.example.com");
+        cfg.oob_http = Some("not-an-address".into());
+        let (addr, warn) = oob_bind(&cfg);
+        assert!(addr.ip().is_loopback(), "a typo must not widen the listener");
+        assert!(warn.is_none());
     }
 }
