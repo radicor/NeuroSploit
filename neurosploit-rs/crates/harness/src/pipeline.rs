@@ -144,6 +144,24 @@ Base everything on real observed responses — never assume. Reply with a COMPAC
 
 /// Operator directives (focus instructions + auth material) prepended to
 /// recon/exploit prompts so the engagement is steered as the user asked.
+/// The probe's credential, resolved from the vault when `cfg.auth` is a slot.
+/// Probes are anonymous by default; an authenticated baseline is what makes the
+/// scan see the app rather than the login page.
+fn probe_auth_pair(cfg: &RunConfig) -> Option<(String, String)> {
+    let a = cfg.auth.as_deref()?;
+    let raw = match a.strip_prefix(crate::vault::SLOT_PREFIX) {
+        Some(id) => cfg.vault.get(id.trim())?.to_string(),
+        None => a.to_string(),
+    };
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(match raw.split_once(':') {
+        Some((k, v)) => (k.trim().to_string(), v.trim().to_string()),
+        None => ("Authorization".to_string(), raw.trim().to_string()),
+    })
+}
+
 fn operator_directives(cfg: &RunConfig) -> String {
     let mut s = String::new();
     // Authorization preamble: injected whenever the operator has scoped the
@@ -174,7 +192,19 @@ fn operator_directives(cfg: &RunConfig) -> String {
             "OUT OF SCOPE — additional operator constraints (techniques, flows, data) beyond the host rules above: {oos}\n"));
     }
     if let Some(auth) = cfg.auth.as_deref().filter(|x| !x.trim().is_empty()) {
-        s.push_str(&format!("AUTHENTICATION — test as an authenticated user; send this with each request: {auth}\n"));
+        // A slotted auth prints the file path and the reference; a literal one is
+        // at least redacted if the vault knows it. Either way the value stays out.
+        if let Some(id) = auth.strip_prefix(crate::vault::SLOT_PREFIX) {
+            s.push_str(&format!(
+                "AUTHENTICATION — test as an authenticated user; {}\n",
+                cfg.vault.prompt_hint(id.trim())
+            ));
+        } else {
+            s.push_str(&format!(
+                "AUTHENTICATION — test as an authenticated user; send this with each request: {}\n",
+                cfg.vault.redact(auth)
+            ));
+        }
     }
     // Operator-supplied API collection (Postman/OpenAPI/HAR): inject the known
     // endpoints as surface to test directly. Parse errors are reported once at
@@ -1004,6 +1034,21 @@ async fn authz_matrix_pass(cfg: &RunConfig, recon: &str, tx: &Sender<String>) ->
 }
 
 pub async fn run(mut cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<String>) -> RunOutput {
+    // Route the operator's --auth value into the vault before any prompt is
+    // built, so `operator_directives` has a reference to print.
+    if crate::vault::slots_enabled() {
+        if let Some(a) = cfg.auth.clone().filter(|x| !x.trim().is_empty()) {
+            if !a.starts_with(crate::vault::SLOT_PREFIX) && cfg.vault.put("auth", &a) {
+                cfg.auth = Some(format!("{}{}", crate::vault::SLOT_PREFIX, "auth"));
+            }
+        }
+        // Prompts name `slots/<id>.header`, so the file must exist before the first
+        // prompt is built. A failure here is loud: a prompt pointing at a missing
+        // file makes the agent unable to authenticate, and silent is worse.
+        if let Err(e) = cfg.vault.materialize_files() {
+            eprintln!("warning: could not materialize vault header files: {e}");
+        }
+    }
     pool.set_progress(tx.clone());
     pool.set_token_limit(cfg.budget.token_limit);
 
@@ -1271,7 +1316,13 @@ pub async fn run(mut cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender
     let probe_facts = if cfg.offline {
         String::new()
     } else {
-        let p = crate::probe::probe_in_scope(&cfg.target, &effective_scope(&cfg)).await;
+        let pa = probe_auth_pair(&cfg);
+        let p = crate::probe::probe_in_scope_auth(
+            &cfg.target,
+            &effective_scope(&cfg),
+            pa.as_ref().map(|(k, v)| (k.as_str(), v.as_str())),
+        )
+        .await;
         let _ = tx.send(crate::probe::probe_summary(&p)).await;
         // Liveness preflight: if the target never answered (connect failed /
         // status 0), don't waste agents on a dead host — abort with a clear note.
@@ -1457,6 +1508,9 @@ pub async fn run(mut cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender
             let shots = shots.clone();
             let txc = tx.clone();
             let wd = cfg.workdir.clone();
+            // Cloned per iteration: the `async move` below owns it, so borrowing
+            // `cfg.vault` there would move `cfg` out of the surrounding function.
+            let vault = cfg.vault.clone();
             async move {
                 // Resume: skip agents already completed in a prior run.
                 if let Some(snap) = snap_ref {
@@ -1541,7 +1595,7 @@ pub async fn run(mut cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender
                             let _ = txc.send(format!("finding: [{}] {} @ {}", c.severity, c.title, c.endpoint)).await;
                             if let Ok(j) = serde_json::to_string(c) { let _ = txc.send(format!("finding_json: {j}")).await; }
                         }
-                        crate::traces::record(wd.as_deref(), &ag.name, &text);
+                        crate::traces::record(wd.as_deref(), &ag.name, &text, &vault);
                         (ag.name.clone(), text, f)
                     }
                     Err(e) => {
@@ -1594,7 +1648,7 @@ pub async fn run(mut cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender
         crate::resilience::load_salvaged(wd)
     } else { Vec::new() };
 
-    crate::traces::record_all(cfg.workdir.as_deref(), &raw);
+    crate::traces::record_all(cfg.workdir.as_deref(), &raw, &cfg.vault);
     let transcript = transcript_of(&raw);
     let mut all_findings: Vec<Finding> = raw.iter().flat_map(|(_, _, f)| f.clone()).collect();
     all_findings.append(&mut prior_salvaged);
@@ -1712,7 +1766,7 @@ pub async fn run_whitebox(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: S
         .collect()
         .await;
 
-    crate::traces::record_all(cfg.workdir.as_deref(), &raw);
+    crate::traces::record_all(cfg.workdir.as_deref(), &raw, &cfg.vault);
     let transcript = transcript_of(&raw);
     let candidates = dedup_findings(raw.iter().flat_map(|(_, _, f)| f.clone()).collect());
     let _ = tx.send(format!("{} candidate finding(s) (deduped) — validating", candidates.len())).await;
@@ -1734,7 +1788,13 @@ pub async fn run_greybox(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Se
     let recon = if cfg.offline {
         "{}".to_string()
     } else {
-        let p = crate::probe::probe_in_scope(&cfg.target, &effective_scope(&cfg)).await;
+        let pa = probe_auth_pair(&cfg);
+        let p = crate::probe::probe_in_scope_auth(
+            &cfg.target,
+            &effective_scope(&cfg),
+            pa.as_ref().map(|(k, v)| (k.as_str(), v.as_str())),
+        )
+        .await;
         let _ = tx.send(crate::probe::probe_summary(&p)).await;
         let facts = crate::probe::probe_json(&p);
         match pool.complete_routed(Task::Recon, "recon", RECON_SYS,
@@ -1874,7 +1934,7 @@ pub async fn run_greybox(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Se
         .buffer_unordered(cfg.concurrency)
         .collect::<Vec<_>>().await;
 
-    crate::traces::record_all(cfg.workdir.as_deref(), &raw);
+    crate::traces::record_all(cfg.workdir.as_deref(), &raw, &cfg.vault);
     let transcript = format!("{}\n{}", code_leads, transcript_of(&raw));
     let candidates = dedup_findings(raw.iter().flat_map(|(_, _, f)| f.clone()).collect());
     let _ = tx.send(format!("{} candidate finding(s) (deduped) — validating", candidates.len())).await;
@@ -3794,8 +3854,12 @@ fn persist(cfg: &RunConfig, recon: &str, transcript: &str, findings: &[Finding])
         return vec![];
     }
     let mut written = Vec::new();
+    let vault = cfg.vault.clone();
     let mut put = |name: &str, content: String| {
         let p = dir.join(name);
+        // Every artefact leaves through here, so redaction happens once, at the
+        // single place a file is written.
+        let content = vault.redact(&content);
         if std::fs::write(&p, content).is_ok() {
             written.push(p.display().to_string());
         }
@@ -4639,7 +4703,7 @@ pub async fn run_container(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: 
         .buffer_unordered(cfg.concurrency)
         .collect::<Vec<_>>().await;
 
-    crate::traces::record_all(cfg.workdir.as_deref(), &raw);
+    crate::traces::record_all(cfg.workdir.as_deref(), &raw, &cfg.vault);
     let transcript = transcript_of(&raw);
     let candidates = dedup_findings(raw.iter().flat_map(|(_, _, f)| f.clone()).collect());
     let _ = tx.send(format!("{} finding(s) (deduped) - validating", candidates.len())).await;
@@ -4738,7 +4802,7 @@ pub async fn run_mobile(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sen
         .buffer_unordered(cfg.concurrency)
         .collect::<Vec<_>>().await;
 
-    crate::traces::record_all(cfg.workdir.as_deref(), &raw);
+    crate::traces::record_all(cfg.workdir.as_deref(), &raw, &cfg.vault);
     let transcript = transcript_of(&raw);
     let candidates = dedup_findings(raw.iter().flat_map(|(_, _, f)| f.clone()).collect());
     let _ = tx.send(format!("{} candidate finding(s) (deduped) - validating", candidates.len())).await;
@@ -4841,7 +4905,7 @@ pub async fn run_host(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sende
         .buffer_unordered(cfg.concurrency)
         .collect::<Vec<_>>().await;
 
-    crate::traces::record_all(cfg.workdir.as_deref(), &raw);
+    crate::traces::record_all(cfg.workdir.as_deref(), &raw, &cfg.vault);
     let transcript = transcript_of(&raw);
     let candidates = dedup_findings(raw.iter().flat_map(|(_, _, f)| f.clone()).collect());
     let _ = tx.send(format!("{} candidate finding(s) (deduped) — validating", candidates.len())).await;
@@ -5484,7 +5548,13 @@ pub async fn run_ai(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<
 
     // Recon the AI endpoint (probe + model recon).
     let recon = if cfg.offline { "{}".to_string() } else {
-        let p = crate::probe::probe_in_scope(&cfg.target, &effective_scope(&cfg)).await;
+        let pa = probe_auth_pair(&cfg);
+        let p = crate::probe::probe_in_scope_auth(
+            &cfg.target,
+            &effective_scope(&cfg),
+            pa.as_ref().map(|(k, v)| (k.as_str(), v.as_str())),
+        )
+        .await;
         let _ = tx.send(crate::probe::probe_summary(&p)).await;
         let facts = crate::probe::probe_json(&p);
         match pool.complete_routed(Task::Recon, "ai-recon", AI_RECON_SYS,
@@ -5545,7 +5615,7 @@ pub async fn run_ai(cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<
         .collect()
         .await;
 
-    crate::traces::record_all(cfg.workdir.as_deref(), &raw);
+    crate::traces::record_all(cfg.workdir.as_deref(), &raw, &cfg.vault);
     let transcript = transcript_of(&raw);
     let candidates = dedup_findings(raw.iter().flat_map(|(_, _, f)| f.clone()).collect());
     let _ = tx.send(format!("{} AI candidate(s) — validating", candidates.len())).await;
@@ -5609,7 +5679,7 @@ pub async fn run_skills_audit(cfg: RunConfig, lib: &Library, pool: &ModelPool, t
         .buffer_unordered(cfg.concurrency)
         .collect()
         .await;
-    crate::traces::record_all(cfg.workdir.as_deref(), &raw);
+    crate::traces::record_all(cfg.workdir.as_deref(), &raw, &cfg.vault);
     let transcript = transcript_of(&raw);
     let candidates = dedup_findings(raw.iter().flat_map(|(_, _, f)| f.clone()).collect());
     let findings = validate(candidates, pool, CODE_VOTE_SYS, effective_vote_n(&cfg), &tx).await;
@@ -6051,6 +6121,57 @@ mod recon_shell_tests {
     /// Drives the **production** `valid_gf_pattern`. The earlier version
     /// re-implemented the guard in a local closure and stayed green when the
     /// production `is_empty` check was removed (validator control A).
+    /// Criterion 5, the "one case per writer" half: `persist` is the single place
+    /// every artefact is written, so a planted secret must be redacted in **all**
+    /// of them — not just the trace the other test covers.
+    #[test]
+    fn persist_redacts_every_writer() {
+        let dir = std::env::temp_dir().join(format!("ns-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let secret = "Bearer sk-live-123";
+
+        let mut cfg = RunConfig::new("https://example.com");
+        cfg.workdir = Some(dir.to_string_lossy().to_string());
+        assert!(cfg.vault.put("auth", secret));
+
+        let finding = Finding { payload: secret.to_string(), ..Default::default() };
+        let written = persist(
+            &cfg,
+            &format!("recon saw {secret} here"),
+            &format!("agent sent {secret} there"),
+            &[finding],
+        );
+        assert!(!written.is_empty(), "persist wrote no artefacts");
+
+        for path in &written {
+            let body = std::fs::read_to_string(path).unwrap_or_default();
+            assert!(!body.contains("sk-live-123"), "{path} leaked the credential");
+        }
+        // Prove redaction ran rather than the secret never being written at all.
+        let referenced = written
+            .iter()
+            .filter(|p| std::fs::read_to_string(p).unwrap_or_default().contains("$VAULT:auth"))
+            .count();
+        assert!(referenced > 0, "no artefact recorded the slot reference");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Criterion 1, the `operator_directives` half: the directive that used to
+    /// inject `send this with each request: <value>` now names the slot and the
+    /// header file.
+    #[test]
+    fn operator_directives_carry_slots_not_values() {
+        let mut cfg = RunConfig::new("https://example.com");
+        let value = "Authorization: Bearer sk-live-123";
+        assert!(cfg.vault.put("auth", value));
+        cfg.auth = Some("$VAULT:auth".into());
+
+        let text = operator_directives(&cfg);
+        assert!(!text.contains("sk-live-123"), "the credential reached the prompt: {text}");
+        assert!(text.contains("$VAULT:auth"), "{text}");
+        assert!(text.contains("slots/auth.header"), "the agent needs the file path: {text}");
+    }
+
     #[test]
     fn gf_pattern_is_validated() {
         for good in ["sqli", "xss", "ssrf", "lfi", "idor", "open-redirect", "a1"] {

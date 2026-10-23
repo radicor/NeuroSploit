@@ -141,6 +141,10 @@ impl Default for Finding {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunConfig {
     pub target: String,
+    /// Operator secrets as slot references. Skipped on (de)serialisation: a
+    /// config round-trip must never carry a value, and an absent field is empty.
+    #[serde(skip)]
+    pub vault: crate::vault::Vault,
     /// Model references in `provider:model` form. The first is primary; the
     /// rest are failover candidates and also the voting panel.
     pub models: Vec<String>,
@@ -344,6 +348,7 @@ impl RunConfig {
     pub fn new(target: impl Into<String>) -> Self {
         RunConfig {
             target: target.into(),
+            vault: crate::vault::Vault::default(),
             models: vec!["anthropic:claude-opus-4-8".into()],
             vote_n: 3,
             concurrency: 8,

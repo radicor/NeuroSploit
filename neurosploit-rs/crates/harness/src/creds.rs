@@ -118,6 +118,11 @@ pub struct Identity {
     pub tier: String,
     /// A real object id this identity legitimately owns (for BOLA baselines).
     pub known_id: String,
+    /// Vault slot id holding this identity's credential. Empty → the value is
+    /// inline (legacy, or slots disabled).
+    pub slot: String,
+    /// Absolute path of the materialized header file for `slot`.
+    pub slot_header: String,
 }
 
 /// Privilege tier an identity holds, for deriving the access-control prior.
@@ -151,6 +156,14 @@ impl Identity {
         None
     }
     fn describe(&self) -> String {
+        // With a slot, the prompt carries a reference and a path — never the value.
+        if !self.slot.is_empty() {
+            let path = if self.slot_header.is_empty() { "(not materialized)".to_string() } else { self.slot_header.clone() };
+            return format!(
+                "{} → send the header file {} (reference $VAULT:{})",
+                self.name, path, self.slot
+            );
+        }
         if let Some(h) = self.header_line() { format!("{} → send `{}`", self.name, h) }
         else if !self.login_url.is_empty() { format!("{} → log in at {} as {}:{} and reuse the session", self.name, self.login_url, self.username, self.password) }
         else { format!("{} → (no usable credential)", self.name) }
@@ -221,6 +234,26 @@ pub struct Creds {
 }
 
 impl Creds {
+    /// Move every usable identity's value into the vault and leave a slot
+    /// reference behind. Returns how many identities were slotted.
+    pub fn adopt_vault(&mut self, vault: &mut crate::vault::Vault) -> usize {
+        if !crate::vault::slots_enabled() {
+            return 0;
+        }
+        let mut n = 0;
+        for r in &mut self.roles {
+            let Some(value) = r.header_line() else { continue };
+            let id = crate::vault::slot_id_for(&r.name);
+            if !vault.put(&id, &value) {
+                continue;
+            }
+            r.slot = id.clone();
+            r.slot_header = vault.header_path(&id).to_string_lossy().to_string();
+            n += 1;
+        }
+        n
+    }
+
     pub fn load(path: &std::path::Path) -> Option<Creds> {
         let text = std::fs::read_to_string(path).ok()?;
         let mut c = Creds::default();

@@ -61,6 +61,17 @@ fn quarantine_path(path: &Path) -> PathBuf {
 /// `<path>.bak`, then rename the temp into place. On failure `path` is left as
 /// it was and no temp file survives.
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    write_atomic_impl(path, data, None)
+}
+
+/// Same as `write_atomic`, but the file is created with an explicit mode so a
+/// secret is never briefly world-readable. Unix only; elsewhere the mode is
+/// ignored (the Windows DACL work is a separate item).
+pub fn write_atomic_mode(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
+    write_atomic_impl(path, data, Some(mode))
+}
+
+fn write_atomic_impl(path: &Path, data: &[u8], mode: Option<u32>) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
             fs::create_dir_all(dir)?;
@@ -68,7 +79,19 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     }
     let tmp = tmp_sibling(path);
     {
-        let mut f = fs::File::create(&tmp)?;
+        #[cfg(unix)]
+        let mut f = match mode {
+            Some(m) => {
+                use std::os::unix::fs::OpenOptionsExt;
+                fs::OpenOptions::new().write(true).create(true).truncate(true).mode(m).open(&tmp)?
+            }
+            None => fs::File::create(&tmp)?,
+        };
+        #[cfg(not(unix))]
+        let mut f = {
+            let _ = mode;
+            fs::File::create(&tmp)?
+        };
         // fsync before the rename, or the name can land without the bytes.
         if let Err(e) = f.write_all(data).and_then(|_| f.sync_all()) {
             let _ = fs::remove_file(&tmp);

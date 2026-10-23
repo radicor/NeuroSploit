@@ -104,6 +104,13 @@ impl PocValidator {
         self
     }
 
+    /// Attach the run's vault. Retests go through `ReplayEngine::send`, which is
+    /// where `$VAULT:<id>` header values resolve, so this is the whole wiring.
+    pub fn with_vault(mut self, vault: crate::vault::Vault) -> Self {
+        self.engine = self.engine.with_vault(vault);
+        self
+    }
+
     /// Validate every finding, in order.
     pub async fn validate_all(&self, findings: &[Finding]) -> Vec<PocResult> {
         let mut out = Vec::with_capacity(findings.len());

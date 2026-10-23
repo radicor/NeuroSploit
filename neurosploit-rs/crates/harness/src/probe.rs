@@ -100,6 +100,15 @@ pub fn http_client() -> reqwest::Client {
 }
 
 fn client() -> reqwest::Client {
+    let mut b = base_builder();
+    if let Some(p) = proxy_url(&std::env::var("NEUROSPLOIT_PROXY").unwrap_or_default()) {
+        if let Ok(px) = reqwest::Proxy::all(p) { b = b.proxy(px); }
+    }
+    b.build().unwrap_or_default()
+}
+
+/// Everything both clients share: UA, timeout, redirect guard, scan headers.
+fn base_builder() -> reqwest::ClientBuilder {
     let ua = std::env::var("NEUROSPLOIT_UA").ok().filter(|v| !v.trim().is_empty())
         .unwrap_or_else(crate::pipeline::default_user_agent);
     // Redirects are followed, but a redirect to a private/loopback address is
@@ -119,18 +128,29 @@ fn client() -> reqwest::Client {
         }
         attempt.follow()
     });
-    let mut b = reqwest::Client::builder()
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .danger_accept_invalid_certs(true)
         .redirect(redirect)
         .default_headers(crate::pipeline::default_scan_headers())
-        .user_agent(ua);
-    if let Ok(p) = std::env::var("NEUROSPLOIT_PROXY") {
-        if !p.trim().is_empty() {
-            if let Ok(px) = reqwest::Proxy::all(&p) { b = b.proxy(px); }
-        }
-    }
-    b.build().unwrap_or_default()
+        .user_agent(ua)
+}
+
+/// Pure form of the proxy flag, so a test can drive the seam without mutating the
+/// process environment. `http_client()` honours it by design (Burp/ZAP).
+pub fn proxy_url(raw: &str) -> Option<&str> {
+    let t = raw.trim();
+    if t.is_empty() { None } else { Some(t) }
+}
+
+/// A client that never proxies. Loopback tests must use this: a proxied client
+/// cannot reach a local mock, and a stray `NEUROSPLOIT_PROXY` would silently
+/// redirect the assertion at whatever the proxy returns.
+pub fn http_client_direct() -> reqwest::Client {
+    base_builder()
+        .no_proxy()
+        .build()
+        .unwrap_or_default()
 }
 
 fn hget(h: &reqwest::header::HeaderMap, k: &str) -> String {
@@ -270,7 +290,27 @@ fn parse_forms(body: &str) -> Vec<FormInfo> {
 /// harness itself sends requests, so the guard runs here rather than trusting
 /// the caller. An out-of-scope target yields an empty probe with a note, not a
 /// request.
+/// Apply a resolved credential to a probe request. Probe baselines are anonymous
+/// by default; when the operator's auth is a vault slot the caller resolves it
+/// once and every request here carries it, so the baseline reflects the
+/// authenticated surface rather than the login page.
+fn with_auth(rb: reqwest::RequestBuilder, auth: Option<(&str, &str)>) -> reqwest::RequestBuilder {
+    match auth {
+        Some((k, v)) => rb.header(k, v),
+        None => rb,
+    }
+}
+
 pub async fn probe_in_scope(target: &str, policy: &crate::scope::ScopePolicy) -> Probe {
+    probe_in_scope_auth(target, policy, None).await
+}
+
+/// As `probe_in_scope`, with a resolved credential attached to every request.
+pub async fn probe_in_scope_auth(
+    target: &str,
+    policy: &crate::scope::ScopePolicy,
+    auth: Option<(&str, &str)>,
+) -> Probe {
     let d = policy.check(target, crate::scope::Action::Probe);
     if !d.allowed() {
         let mut p = Probe::default();
@@ -278,18 +318,22 @@ pub async fn probe_in_scope(target: &str, policy: &crate::scope::ScopePolicy) ->
         return p;
     }
     if let crate::scope::Decision::Warn(w) = d {
-        let mut p = probe(target).await;
+        let mut p = probe_auth(target, auth).await;
         p.notes.push(format!("scope guard: {w}"));
         return p;
     }
-    probe(target).await
+    probe_auth(target, auth).await
 }
 
 pub async fn probe(target: &str) -> Probe {
+    probe_auth(target, None).await
+}
+
+pub async fn probe_auth(target: &str, auth: Option<(&str, &str)>) -> Probe {
     let mut p = Probe { url: target.to_string(), ..Default::default() };
     let c = client();
 
-    let resp = match c.get(target).send().await {
+    let resp = match with_auth(c.get(target), auth).send().await {
         Ok(r) => r,
         Err(e) => { p.notes.push(format!("initial GET failed: {e}")); return p; }
     };
@@ -371,7 +415,7 @@ pub async fn probe(target: &str) -> Probe {
     }
 
     // CORS reflection probe.
-    if let Ok(r2) = c.get(target).header("Origin", "https://evil.neurosploit.test").send().await {
+    if let Ok(r2) = with_auth(c.get(target).header("Origin", "https://evil.neurosploit.test"), auth).send().await {
         let acao = hget(r2.headers(), "access-control-allow-origin");
         let acac = hget(r2.headers(), "access-control-allow-credentials");
         p.cors.wildcard = acao.trim() == "*";
@@ -381,7 +425,7 @@ pub async fn probe(target: &str) -> Probe {
 
     // 404 baseline (soft-404 detection).
     let base = format!("{}/nrsplt_baseline_404_check_9x7", target.trim_end_matches('/'));
-    if let Ok(rb) = c.get(&base).send().await {
+    if let Ok(rb) = with_auth(c.get(&base), auth).send().await {
         p.baseline_404_status = rb.status().as_u16();
         p.baseline_404_len = rb.text().await.unwrap_or_default().len();
     }
@@ -389,7 +433,7 @@ pub async fn probe(target: &str) -> Probe {
     // A few high-signal paths (kept small to stay fast).
     for path in ["/robots.txt", "/sitemap.xml", "/.well-known/security.txt", "/.git/config", "/.env"] {
         let u = format!("{}{}", target.trim_end_matches('/'), path);
-        if let Ok(rp) = c.get(&u).send().await {
+        if let Ok(rp) = with_auth(c.get(&u), auth).send().await {
             let st = rp.status().as_u16();
             let len = rp.text().await.unwrap_or_default().len();
             // only report if it looks like a real hit (200 and unlike the 404 baseline)

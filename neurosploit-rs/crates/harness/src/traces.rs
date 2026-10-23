@@ -31,19 +31,21 @@ fn file_name(agent: &str) -> String {
 }
 
 /// Record one agent's transcript (overwrites: the latest pass is the trace).
-pub fn record(workdir: Option<&str>, agent: &str, text: &str) {
+pub fn record(workdir: Option<&str>, agent: &str, text: &str, vault: &crate::vault::Vault) {
     if text.trim().is_empty() {
         return;
     }
     if let Some(d) = dir(workdir) {
-        let _ = std::fs::write(d.join(file_name(agent)), text);
+        // Redact before the write: a trace is the primary place a completion
+        // would otherwise record the credential verbatim.
+        let _ = std::fs::write(d.join(file_name(agent)), vault.redact(text));
     }
 }
 
 /// Record every agent of a phase.
-pub fn record_all<F>(workdir: Option<&str>, raw: &[(String, String, F)]) {
+pub fn record_all<F>(workdir: Option<&str>, raw: &[(String, String, F)], vault: &crate::vault::Vault) {
     for (agent, text, _) in raw {
-        record(workdir, agent, text);
+        record(workdir, agent, text, vault);
     }
 }
 
@@ -190,8 +192,8 @@ mod tests {
     #[test]
     fn digest_extracts_structure_not_raw_lines() {
         let w = tmp("digest");
-        record(Some(&w), "sqli_error", "GET /api/orders/12?id=1&sort=asc\nYou have an error in your SQL syntax near\nServer: nginx/1.18.0\npassword=Hunter2Secret");
-        record(Some(&w), "xss_reflected", "POST https://t.test/search?q=x\nblocked by Cloudflare");
+        record(Some(&w), "sqli_error", "GET /api/orders/12?id=1&sort=asc\nYou have an error in your SQL syntax near\nServer: nginx/1.18.0\npassword=Hunter2Secret", &Default::default());
+        record(Some(&w), "xss_reflected", "POST https://t.test/search?q=x\nblocked by Cloudflare", &Default::default());
         let d = digest(Some(&w), None);
         assert!(d.contains("/api/orders/{id}"), "{d}");
         assert!(d.contains("sort"), "{d}");
@@ -206,7 +208,7 @@ mod tests {
     #[test]
     fn own_trace_is_excluded() {
         let w = tmp("excl");
-        record(Some(&w), "agent_a", "GET /only-a");
+        record(Some(&w), "agent_a", "GET /only-a", &Default::default());
         assert!(digest(Some(&w), Some("agent_a")).is_empty());
         assert!(digest(Some(&w), None).contains("/only-a"));
         let _ = std::fs::remove_dir_all(&w);
