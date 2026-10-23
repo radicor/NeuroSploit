@@ -613,6 +613,13 @@ impl ScopePolicy {
     }
 
     /// Check an outbound HTTP request: the URL, the verb and the payload.
+    /// Check a CONNECT authority (`host:port`). Deliberately a wrapper over
+    /// `check_request` rather than a second matcher: if the two disagreed, the
+    /// same host could be refused for HTTPS and allowed for HTTP.
+    pub fn check_connect(&self, host: &str, port: u16) -> Decision {
+        self.check_request(&format!("https://{host}:{port}/"), "GET", "")
+    }
+
     pub fn check_request(&self, url: &str, method: &str, body: &str) -> Decision {
         let m = method.trim().to_uppercase();
         let action = match m.as_str() {

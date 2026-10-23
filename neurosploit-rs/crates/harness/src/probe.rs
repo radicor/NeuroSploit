@@ -100,7 +100,14 @@ pub fn http_client() -> reqwest::Client {
 }
 
 fn client() -> reqwest::Client {
-    let mut b = base_builder();
+    client_for(None)
+}
+
+/// A client whose redirects are judged by `policy`. The in-scope probe uses
+/// this, so a 302 off the authorized surface is returned as data rather than
+/// followed — and a hostname pointing at loopback is stopped before it resolves.
+fn client_for(policy: Option<std::sync::Arc<crate::scope::ScopePolicy>>) -> reqwest::Client {
+    let mut b = base_builder_for(policy);
     if let Some(p) = proxy_url(&std::env::var("NEUROSPLOIT_PROXY").unwrap_or_default()) {
         if let Ok(px) = reqwest::Proxy::all(p) { b = b.proxy(px); }
     }
@@ -109,24 +116,60 @@ fn client() -> reqwest::Client {
 
 /// Everything both clients share: UA, timeout, redirect guard, scan headers.
 fn base_builder() -> reqwest::ClientBuilder {
+    base_builder_for(None)
+}
+
+fn base_builder_for(
+    policy: Option<std::sync::Arc<crate::scope::ScopePolicy>>,
+) -> reqwest::ClientBuilder {
     let ua = std::env::var("NEUROSPLOIT_UA").ok().filter(|v| !v.trim().is_empty())
         .unwrap_or_else(crate::pipeline::default_user_agent);
-    // Redirects are followed, but a redirect to a private/loopback address is
-    // refused — that is the SSRF-redirect-to-internal pivot, and reqwest would
-    // otherwise chase it off the authorized surface. Normal cross-host
-    // redirects between public hosts are still followed (the scope layer judges
-    // the findings; this only stops the network-level pivot).
-    let redirect = reqwest::redirect::Policy::custom(|attempt| {
+    // A redirect is a request the server asks us to make, so it passes the same
+    // boundary as any other: resolve the target (a hostname pointing at
+    // loopback is the same pivot as a literal) and, when a policy is attached,
+    // ask the scope layer. Without a policy the literal check still applies —
+    // that is the recorder-only case.
+    let redirect_policy = policy.clone();
+    let redirect = reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= 5 {
             return attempt.stop();
         }
-        let host = crate::netguard::normalize_host(attempt.url().host_str().unwrap_or(""));
-        if let Some(ip) = crate::netguard::parse_ip_any(&host) {
-            if crate::netguard::is_private(&ip) {
-                return attempt.stop();
+        let next = attempt.url().as_str();
+        match &redirect_policy {
+            Some(pol) => {
+                // Resolve before following: a hostname pointing at loopback is
+                // the same pivot as a literal, and only resolution can see it.
+                let next_host = crate::scope::host_of(next);
+                if crate::netguard::pin(&next_host).is_err() {
+                    return attempt.stop();
+                }
+                let prev = attempt
+                    .previous()
+                    .last()
+                    .map(|u| u.as_str().to_string())
+                    .unwrap_or_default();
+                match crate::netguard::redirect_allowed(&prev, next, |u| {
+                    pol.check(u, crate::scope::Action::Probe).allowed()
+                }) {
+                    Ok(_) => attempt.follow(),
+                    Err(_) => attempt.stop(),
+                }
+            }
+            // No policy: keep the previous behaviour exactly — a literal
+            // private target is refused, and no DNS lookup is introduced for
+            // clients that never opted into scope enforcement.
+            None => {
+                let host = crate::netguard::normalize_host(
+                    attempt.url().host_str().unwrap_or(""),
+                );
+                if let Some(ip) = crate::netguard::parse_ip_any(&host) {
+                    if crate::netguard::is_private(&ip) {
+                        return attempt.stop();
+                    }
+                }
+                attempt.follow()
             }
         }
-        attempt.follow()
     });
     reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -317,12 +360,13 @@ pub async fn probe_in_scope_auth(
         p.notes.push(format!("scope guard blocked the probe: {}", d.reason()));
         return p;
     }
+    let policy = std::sync::Arc::new(policy.clone());
     if let crate::scope::Decision::Warn(w) = d {
-        let mut p = probe_auth(target, auth).await;
+        let mut p = probe_auth_with_policy(target, auth, Some(policy)).await;
         p.notes.push(format!("scope guard: {w}"));
         return p;
     }
-    probe_auth(target, auth).await
+    probe_auth_with_policy(target, auth, Some(policy)).await
 }
 
 pub async fn probe(target: &str) -> Probe {
@@ -330,8 +374,19 @@ pub async fn probe(target: &str) -> Probe {
 }
 
 pub async fn probe_auth(target: &str, auth: Option<(&str, &str)>) -> Probe {
+    probe_auth_with_policy(target, auth, None).await
+}
+
+/// As `probe_auth`, but redirects are judged by `policy`. `probe_in_scope_auth`
+/// uses this: the scope check on the first request is not enough when the target
+/// can hand back a 302 to somewhere else.
+pub async fn probe_auth_with_policy(
+    target: &str,
+    auth: Option<(&str, &str)>,
+    policy: Option<std::sync::Arc<crate::scope::ScopePolicy>>,
+) -> Probe {
     let mut p = Probe { url: target.to_string(), ..Default::default() };
-    let c = client();
+    let c = client_for(policy);
 
     let resp = match with_auth(c.get(target), auth).send().await {
         Ok(r) => r,
@@ -565,5 +620,88 @@ mod tests {
     fn brand_reads_a_copyright_notice_past_a_length_changing_prefix() {
         let body = format!("{}<p>&copy; 2026 Acme Widgets</p>", "ẞ".repeat(300));
         assert_eq!(brand_after(&body), "Acme Widgets");
+    }
+}
+#[cfg(test)]
+mod redirect_scope_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Criterion 5. The redirect target is IN SCOPE by name (`localhost`), so the
+    /// scope check alone would follow it; only resolution shows that the name is
+    /// loopback.
+    ///
+    /// The canary counts only requests for the redirect's own path: a bare accept
+    /// count is not evidence, because this environment has a scanner that
+    /// connects to fresh loopback listeners (the SEC-008 accept-race lesson).
+    #[tokio::test]
+    async fn a_302_to_an_in_scope_hostname_that_resolves_to_loopback_is_not_followed() {
+        let redirected = Arc::new(AtomicUsize::new(0));
+        let other = Arc::new(AtomicUsize::new(0));
+
+        let canary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let canary_port = canary.local_addr().unwrap().port();
+        let (rd, ot) = (redirected.clone(), other.clone());
+        tokio::spawn(async move {
+            for _ in 0..8 {
+                match tokio::time::timeout(std::time::Duration::from_secs(3), canary.accept()).await {
+                    Ok(Ok((mut s, _))) => {
+                        let mut b = [0u8; 2048];
+                        let n = s.read(&mut b).await.unwrap_or(0);
+                        let head = String::from_utf8_lossy(&b[..n]).to_lowercase();
+                        if head.contains("/moved") {
+                            rd.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            ot.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let _ = s
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nHIT!!")
+                            .await;
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // Answer every request on the origin: the probe makes more than one
+            // (Origin-header check, 404 baseline), and a single accept would make
+            // this test depend on which request won.
+            for _ in 0..8 {
+                match tokio::time::timeout(std::time::Duration::from_secs(3), origin.accept()).await {
+                    Ok(Ok((mut s, _))) => {
+                        let mut b = [0u8; 2048];
+                        let _ = s.read(&mut b).await;
+                        let resp = format!(
+                            "HTTP/1.1 302 Found\r\nlocation: http://localhost:{canary_port}/moved\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        );
+                        let _ = s.write_all(resp.as_bytes()).await;
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let mut policy = crate::scope::ScopePolicy::for_target(&format!("http://127.0.0.1:{origin_port}/"));
+        // Authorized by name, which is the trap: scope alone says yes.
+        policy
+            .hard
+            .push(crate::scope::Pattern::parse("localhost").expect("pattern"));
+
+        let p = probe_in_scope_auth(&format!("http://127.0.0.1:{origin_port}/"), &policy, None).await;
+        assert_eq!(p.status, 302, "the redirect must come back as data, notes: {:?}", p.notes);
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            redirected.load(Ordering::SeqCst),
+            0,
+            "the client followed the redirect: {} request(s) for /moved reached the canary ({} unrelated connection(s) also seen)",
+            redirected.load(Ordering::SeqCst),
+            other.load(Ordering::SeqCst)
+        );
     }
 }

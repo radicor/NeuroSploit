@@ -137,10 +137,64 @@ impl Default for Finding {
     }
 }
 
+/// How far a run is fenced. `Scoped` is the default: the egress choke starts
+/// and every outbound connect is policy-checked. `Yolo` is the operator's
+/// explicit opt-out of that promise and prints a banner. `Isolated` is parsed
+/// but refused until v4.6, so it can never silently behave like another mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionMode {
+    #[default]
+    Scoped,
+    Isolated,
+    Yolo,
+}
+
+impl ExecutionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExecutionMode::Scoped => "scoped",
+            ExecutionMode::Isolated => "isolated",
+            ExecutionMode::Yolo => "yolo",
+        }
+    }
+
+    /// Refuse the variants this build cannot honour. `accept_unfenced` is the
+    /// API client's second switch: a remote caller is not the operator, so
+    /// `yolo` needs both the mode and that flag. The CLI flag is its own consent.
+    pub fn admit(self, accept_unfenced: bool) -> Result<Self, String> {
+        match self {
+            ExecutionMode::Scoped => Ok(self),
+            ExecutionMode::Yolo if accept_unfenced => Ok(self),
+            ExecutionMode::Yolo => Err("yolo requires acceptUnfenced: true".into()),
+            ExecutionMode::Isolated => Err("isolated is not implemented until v4.6".into()),
+        }
+    }
+}
+
+impl std::str::FromStr for ExecutionMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "scoped" => Ok(ExecutionMode::Scoped),
+            "isolated" => Ok(ExecutionMode::Isolated),
+            "yolo" => Ok(ExecutionMode::Yolo),
+            other => Err(format!(
+                "execution-mode must be scoped | isolated | yolo, got `{other}`"
+            )),
+        }
+    }
+}
+
 /// Configuration for a single engagement run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunConfig {
     pub target: String,
+    /// How far the run is fenced (SEC-010). Defaults to `scoped`: egress is
+    /// policy-checked and the choke always starts. `yolo` is explicit.
+    #[serde(default)]
+    pub execution_mode: ExecutionMode,
     /// Operator secrets as slot references. Skipped on (de)serialisation: a
     /// config round-trip must never carry a value, and an absent field is empty.
     #[serde(skip)]
@@ -348,6 +402,7 @@ impl RunConfig {
     pub fn new(target: impl Into<String>) -> Self {
         RunConfig {
             target: target.into(),
+            execution_mode: ExecutionMode::Scoped,
             vault: crate::vault::Vault::default(),
             models: vec!["anthropic:claude-opus-4-8".into()],
             vote_n: 3,
@@ -391,6 +446,58 @@ impl RunConfig {
             api_collection: None,
             reference_prompts: Vec::new(),
             autonomy: default_autonomy(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod execution_mode_tests {
+    use super::*;
+
+    #[test]
+    fn the_default_is_scoped_on_the_constructor_and_the_deserialiser() {
+        assert_eq!(ExecutionMode::default(), ExecutionMode::Scoped);
+        assert_eq!(
+            RunConfig::new("https://example.com").execution_mode,
+            ExecutionMode::Scoped
+        );
+        // A config written before the field existed must not deserialise to
+        // `yolo`; the default is the fenced mode, not the convenient one.
+        let cfg: RunConfig =
+            serde_json::from_str(r#"{"target":"https://example.com","models":[]}"#).unwrap();
+        assert_eq!(cfg.execution_mode, ExecutionMode::Scoped);
+    }
+
+    #[test]
+    fn yolo_needs_the_second_switch_and_isolated_names_why() {
+        assert!(ExecutionMode::Yolo.admit(false).is_err());
+        assert_eq!(ExecutionMode::Yolo.admit(true).unwrap(), ExecutionMode::Yolo);
+        assert!(ExecutionMode::Scoped.admit(false).is_ok());
+        let err = ExecutionMode::Isolated.admit(true).unwrap_err();
+        assert!(err.contains("v4.6"), "isolated must say why: {err}");
+    }
+
+    #[test]
+    fn the_wire_form_is_lowercase_and_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&ExecutionMode::Scoped).unwrap(),
+            "\"scoped\""
+        );
+        assert_eq!(
+            "YOLO".parse::<ExecutionMode>().unwrap(),
+            ExecutionMode::Yolo
+        );
+        assert!("bogus".parse::<ExecutionMode>().is_err());
+    }
+
+    #[test]
+    fn as_str_matches_the_serde_form() {
+        for m in [
+            ExecutionMode::Scoped,
+            ExecutionMode::Isolated,
+            ExecutionMode::Yolo,
+        ] {
+            assert_eq!(format!("\"{}\"", m.as_str()), serde_json::to_string(&m).unwrap());
         }
     }
 }

@@ -133,6 +133,10 @@ pub struct Flow {
     /// Response content-type, when seen in cleartext.
     #[serde(default)]
     pub content_type: String,
+    /// True when the choke refused this destination instead of dialling it.
+    /// A refused flow is evidence, so it is recorded like any other.
+    #[serde(default)]
+    pub denied: bool,
 }
 
 /// How the harness should route its traffic.
@@ -162,6 +166,7 @@ impl ProxyConfig {
     /// ```text
     ///   burp | caido | zap | mitmproxy      → route straight through the tool
     ///   own                                 → own interceptor only, no upstream
+    ///   own@127.0.0.1:9000                  → own interceptor on a chosen bind
     ///   own+burp | own+caido | own+…        → own interceptor, recording, then the tool
     ///   http://127.0.0.1:8080               → an explicit upstream proxy
     /// ```
@@ -173,6 +178,12 @@ impl ProxyConfig {
         if let Some(rest) = s.strip_prefix("own+") {
             let tool = Tool::parse(rest).ok_or_else(|| format!("unknown upstream tool `{rest}`"))?;
             return Ok(ProxyConfig { own_interceptor: true, upstream: Some(tool), ..Default::default() });
+        }
+        if let Some(rest) = s.strip_prefix("own@") {
+            let bind: SocketAddr = rest
+                .parse()
+                .map_err(|_| format!("own@ needs host:port, got `{rest}`"))?;
+            return Ok(ProxyConfig { own_interceptor: true, bind, upstream: None, ..Default::default() });
         }
         if s == "own" {
             return Ok(ProxyConfig { own_interceptor: true, upstream: None, ..Default::default() });
@@ -201,14 +212,50 @@ impl ProxyConfig {
     /// same way the harness does.
     pub fn env(&self) -> Vec<(String, String)> {
         match self.client_proxy_url() {
-            Some(p) => vec![
-                ("HTTP_PROXY".into(), p.clone()),
-                ("HTTPS_PROXY".into(), p.clone()),
-                ("http_proxy".into(), p.clone()),
-                ("https_proxy".into(), p),
-            ],
+            Some(p) => ProxyConfig::env_for(&p),
             None => Vec::new(),
         }
+    }
+
+    /// The proxy environment for a concrete URL. Separate from `env()` because a
+    /// choke bound to port 0 learns its address only after `listen`.
+    pub fn env_for(url: &str) -> Vec<(String, String)> {
+        vec![
+            ("HTTP_PROXY".into(), url.to_string()),
+            ("HTTPS_PROXY".into(), url.to_string()),
+            ("ALL_PROXY".into(), url.to_string()),
+            ("http_proxy".into(), url.to_string()),
+            ("https_proxy".into(), url.to_string()),
+            ("all_proxy".into(), url.to_string()),
+        ]
+    }
+
+    /// `NO_PROXY` value: loopback always, plus whatever the run must reach
+    /// directly (provider APIs). Never a wildcard — that would disable the
+    /// choke for every host while looking like a configuration.
+    pub fn no_proxy_value(extra: &[String]) -> String {
+        let mut hosts: Vec<String> = vec![
+            "127.0.0.1".into(),
+            "localhost".into(),
+            "::1".into(),
+        ];
+        for h in extra {
+            let h = h.trim().to_lowercase();
+            if !h.is_empty() && h != "*" && !hosts.contains(&h) {
+                hosts.push(h);
+            }
+        }
+        hosts.join(",")
+    }
+
+    /// The full child environment: proxy vars plus a `NO_PROXY` that keeps
+    /// loopback and the named providers off the choke.
+    pub fn env_with_no_proxy(url: &str, extra: &[String]) -> Vec<(String, String)> {
+        let mut v = ProxyConfig::env_for(url);
+        let np = ProxyConfig::no_proxy_value(extra);
+        v.push(("NO_PROXY".into(), np.clone()));
+        v.push(("no_proxy".into(), np));
+        v
     }
 
     pub fn summary(&self) -> String {
@@ -221,17 +268,208 @@ impl ProxyConfig {
     }
 }
 
+/// Why the choke refused a destination. Each variant maps to one code, so a
+/// refusal is machine-readable and a test can name the branch that refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyReason {
+    OutOfScope,
+    PrivateAddress,
+    RebindDetected,
+}
+
+impl DenyReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            DenyReason::OutOfScope => "OUT_OF_SCOPE",
+            DenyReason::PrivateAddress => "PRIVATE_ADDRESS",
+            DenyReason::RebindDetected => "REBIND_DETECTED",
+        }
+    }
+}
+
+/// Hosts the scope policy does not govern: the run's own out-of-band listener
+/// (which is internal by design) and provider APIs the harness itself calls.
+#[derive(Debug, Clone, Default)]
+pub struct ExtraAllow {
+    /// Suffixes such as ".oob.example.com" or the bare apex.
+    pub oob_suffixes: Vec<String>,
+    pub passthrough_hosts: Vec<String>,
+}
+
+impl ExtraAllow {
+    pub fn allows(&self, host: &str) -> bool {
+        self.passthrough_hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(host))
+            || self.oob_suffixes.iter().any(|s| {
+                let suffix = s.trim_start_matches('*');
+                host.ends_with(suffix) || host == suffix.trim_start_matches('.')
+            })
+    }
+}
+
+/// Split `host:port` (CONNECT authority), tolerating `[v6]:port`.
+fn split_host_port(s: &str) -> (String, u16) {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some((h, p)) = rest.split_once("]:") {
+            return (h.to_string(), p.parse().unwrap_or(443));
+        }
+    }
+    match s.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            (h.to_string(), p.parse().unwrap_or(443))
+        }
+        _ => (s.to_string(), 443),
+    }
+}
+
+/// Host and port from an absolute-form URL (`http://host:port/path`).
+fn host_port_from_url(url: &str) -> (String, u16) {
+    let after = url.split("://").nth(1).unwrap_or(url);
+    let authority = after.split(['/', '?', '#']).next().unwrap_or(after);
+    let (host, port) = split_host_port(authority);
+    (host, if port == 443 { 80 } else { port })
+}
+
 /// The running own interceptor: a recording forward proxy.
 #[derive(Clone)]
 pub struct Interceptor {
     upstream: Option<String>,
     flows: Arc<Mutex<Vec<Flow>>>,
     jsonl: Option<String>,
+    /// The run's effective policy. `None` means no policy was attached (yolo, or
+    /// a caller using the interceptor purely as a recorder).
+    policy: Option<Arc<crate::scope::ScopePolicy>>,
+    rebind: Option<Arc<Mutex<crate::netguard::RebindGuard>>>,
+    extras: ExtraAllow,
+    /// Seam so a test can drive admission without DNS; production uses
+    /// `netguard::resolve`.
+    resolver: Arc<dyn Fn(&str) -> Vec<std::net::IpAddr> + Send + Sync>,
 }
 
 impl Interceptor {
     pub fn new(upstream: Option<String>) -> Self {
-        Interceptor { upstream, flows: Arc::new(Mutex::new(Vec::new())), jsonl: None }
+        Interceptor {
+            upstream,
+            flows: Arc::new(Mutex::new(Vec::new())),
+            jsonl: None,
+            policy: None,
+            rebind: None,
+            extras: ExtraAllow::default(),
+            resolver: Arc::new(crate::netguard::resolve),
+        }
+    }
+
+    /// Attach the run's effective scope. Without this the interceptor records
+    /// but admits anything, which is only correct for `yolo`.
+    pub fn with_policy(mut self, policy: Arc<crate::scope::ScopePolicy>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    pub fn with_rebind_guard(mut self, guard: Arc<Mutex<crate::netguard::RebindGuard>>) -> Self {
+        self.rebind = Some(guard);
+        self
+    }
+
+    pub fn with_extras(mut self, extras: ExtraAllow) -> Self {
+        self.extras = extras;
+        self
+    }
+
+    pub fn with_resolver(
+        mut self,
+        resolver: Arc<dyn Fn(&str) -> Vec<std::net::IpAddr> + Send + Sync>,
+    ) -> Self {
+        self.resolver = resolver;
+        self
+    }
+
+    /// Decide whether this CONNECT/absolute-form target may be dialled, and
+    /// which addresses may be dialled. Every address returned is one this
+    /// function vetted, so the dial must use them rather than re-resolving.
+    pub fn admit(&self, host: &str, port: u16) -> Result<Vec<std::net::IpAddr>, DenyReason> {
+        use crate::netguard::{is_private, normalize_host, parse_ip_any};
+        let host = normalize_host(host);
+        let extra = self.extras.allows(&host);
+        let hard = self.hard_allows(&host);
+
+        // No policy and no guard means this interceptor is a recorder (yolo, or
+        // a caller using it to watch traffic). The policy is what makes it a
+        // choke; pretending otherwise would refuse the recorder's own harness.
+        if self.policy.is_none() && self.rebind.is_none() {
+            if let Some(ip) = parse_ip_any(&host) {
+                return Ok(vec![ip]);
+            }
+            let resolved = (self.resolver)(&host);
+            return if resolved.is_empty() {
+                Err(DenyReason::OutOfScope)
+            } else {
+                Ok(resolved)
+            };
+        }
+
+        // A literal (or obfuscated) address needs no resolution, and the reason
+        // it is refused should say "private", not "out of scope" — the operator
+        // needs to know an internal pivot was attempted.
+        if let Some(ip) = parse_ip_any(&host) {
+            if is_private(&ip) && !hard && !extra {
+                return Err(DenyReason::PrivateAddress);
+            }
+            if !extra && !self.in_scope(&host, port) {
+                return Err(DenyReason::OutOfScope);
+            }
+            return Ok(vec![ip]);
+        }
+
+        if !extra && !self.in_scope(&host, port) {
+            return Err(DenyReason::OutOfScope);
+        }
+        let resolved = (self.resolver)(&host);
+        if resolved.is_empty() {
+            return Err(DenyReason::OutOfScope);
+        }
+        // The guard knows whether it has seen this name before, so it decides
+        // first: a new private address on a re-resolution is a rebind, not an
+        // ordinary private target, and the two codes must not collapse.
+        if let Some(g) = &self.rebind {
+            let seen = g.lock().map(|g| g.seen(&host)).unwrap_or(false);
+            let mut g = g.lock().map_err(|_| DenyReason::RebindDetected)?;
+            return match g.check_with(&host, resolved.clone()) {
+                Ok(pinned) => Ok(pinned),
+                // A name that has resolved before and now gains a private
+                // address is a rebind whatever the scope says about it.
+                Err(_) if seen => Err(DenyReason::RebindDetected),
+                // First sight of an internal name the operator explicitly
+                // authorized (hard scope or extras) is an intended target.
+                Err(_) if hard || extra => Ok(resolved),
+                Err(_) => Err(DenyReason::PrivateAddress),
+            };
+        }
+        if resolved.iter().any(is_private) && !hard && !extra {
+            return Err(DenyReason::PrivateAddress);
+        }
+        Ok(resolved)
+    }
+
+    fn in_scope(&self, host: &str, port: u16) -> bool {
+        match &self.policy {
+            Some(p) => p.check_connect(host, port).allowed(),
+            None => true,
+        }
+    }
+
+    /// A hard entry is an explicit authorization of that host, which is what
+    /// lets an internal literal through when the operator named it.
+    fn hard_allows(&self, host: &str) -> bool {
+        match &self.policy {
+            Some(p) => p
+                .hard
+                .iter()
+                .any(|pat| pat.matches(&format!("https://{host}/"))),
+            None => false,
+        }
     }
 
     /// Also append every flow to a JSONL file, so a run's traffic survives it.
@@ -274,9 +512,12 @@ impl Interceptor {
         }
     }
 
-    /// Start listening. Returns once bound; serving continues in the background.
-    pub async fn listen(&self, bind: SocketAddr) -> std::io::Result<()> {
+    /// Start listening. Returns the address actually bound — a caller that asked
+    /// for port 0 needs it to export the right proxy URL — and serving continues
+    /// in the background.
+    pub async fn listen(&self, bind: SocketAddr) -> std::io::Result<SocketAddr> {
         let listener = tokio::net::TcpListener::bind(bind).await?;
+        let addr = listener.local_addr()?;
         let me = self.clone();
         tokio::spawn(async move {
             loop {
@@ -286,6 +527,35 @@ impl Interceptor {
                     let _ = me.serve(sock).await;
                 });
             }
+        });
+        Ok(addr)
+    }
+
+    /// Refuse an admitted-against destination. The 403 is for the client; the
+    /// recorded flow is for the operator, so a refusal is evidence rather than
+    /// a silent drop.
+    async fn refuse(&self, mut client: tokio::net::TcpStream, target: &str, method: &str, reason: DenyReason) -> std::io::Result<()> {
+        let body = format!("{} refused: {target}", reason.code());
+        let _ = client
+            .write_all(
+                format!(
+                    "HTTP/1.1 403 Forbidden\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await;
+        self.record(Flow {
+            at: now(),
+            method: method.to_uppercase(),
+            url: target.to_string(),
+            status: 403,
+            req_bytes: 0,
+            resp_bytes: body.len(),
+            tunnelled: false,
+            content_type: "text/plain".into(),
+            denied: true,
         });
         Ok(())
     }
@@ -312,9 +582,17 @@ impl Interceptor {
         let target = parts.next().unwrap_or("").to_string();
 
         if method.eq_ignore_ascii_case("CONNECT") {
-            self.tunnel(client, &target).await
+            let (host, port) = split_host_port(&target);
+            match self.admit(&host, port) {
+                Ok(pinned) => self.tunnel(client, &target, &pinned).await,
+                Err(reason) => self.refuse(client, &target, &method, reason).await,
+            }
         } else if target.starts_with("http://") {
-            self.forward_http(client, &method, &target, &head_str).await
+            let (host, port) = host_port_from_url(&target);
+            match self.admit(&host, port) {
+                Ok(pinned) => self.forward_http(client, &method, &target, &head_str, &pinned).await,
+                Err(reason) => self.refuse(client, &target, &method, reason).await,
+            }
         } else {
             let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\nconnection: close\r\n\r\nthis proxy handles absolute-form HTTP and CONNECT").await;
             Ok(())
@@ -323,8 +601,14 @@ impl Interceptor {
 
     /// Plain HTTP: forward via reqwest (honouring an upstream proxy), record
     /// the full flow, and write the response back to the client.
-    async fn forward_http(&self, mut client: tokio::net::TcpStream, method: &str, url: &str, head: &str) -> std::io::Result<()> {
+    async fn forward_http(&self, mut client: tokio::net::TcpStream, method: &str, url: &str, head: &str, pinned: &[std::net::IpAddr]) -> std::io::Result<()> {
+        let (host, port) = host_port_from_url(url);
         let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none());
+        // Dial the address `admit` vetted, not a fresh resolution: a second
+        // lookup is exactly the rebinding window the guard just closed.
+        if let Some(ip) = pinned.first() {
+            builder = builder.resolve(&host, std::net::SocketAddr::new(*ip, port));
+        }
         if let Some(up) = &self.upstream {
             if let Ok(px) = reqwest::Proxy::all(up) {
                 builder = builder.proxy(px);
@@ -368,12 +652,13 @@ impl Interceptor {
                     resp_bytes: body.len(),
                     tunnelled: false,
                     content_type: ct,
+                    denied: false,
                 });
             }
             Err(e) => {
                 req_bytes += 0;
                 let _ = client.write_all(format!("HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\n\r\n{e}").as_bytes()).await;
-                self.record(Flow { at: now, method: method.to_uppercase(), url: url.to_string(), status: 502, req_bytes, resp_bytes: 0, tunnelled: false, content_type: String::new() });
+                self.record(Flow { at: now, method: method.to_uppercase(), url: url.to_string(), status: 502, req_bytes, resp_bytes: 0, tunnelled: false, content_type: String::new(), denied: false });
             }
         }
         Ok(())
@@ -385,7 +670,7 @@ impl Interceptor {
     /// full interception; without one, we connect straight to the target and
     /// relay bytes, recording host, timing and byte counts. We do NOT pretend
     /// to see the plaintext.
-    async fn tunnel(&self, mut client: tokio::net::TcpStream, target: &str) -> std::io::Result<()> {
+    async fn tunnel(&self, mut client: tokio::net::TcpStream, target: &str, pinned: &[std::net::IpAddr]) -> std::io::Result<()> {
         let now = now();
         // Connect to the upstream tool if configured, else to the target.
         let (mut server, via_upstream) = match &self.upstream {
@@ -406,13 +691,20 @@ impl Interceptor {
                     }
                 }
             }
-            None => match tokio::net::TcpStream::connect(target).await {
-                Ok(s) => (s, false),
-                Err(e) => {
-                    let _ = client.write_all(format!("HTTP/1.1 502 Bad Gateway\r\n\r\n{e}").as_bytes()).await;
-                    return Ok(());
+            None => {
+                let (_, port) = split_host_port(target);
+                let sa = match pinned.first() {
+                    Some(ip) => std::net::SocketAddr::new(*ip, port),
+                    None => return self.refuse(client, target, "CONNECT", DenyReason::OutOfScope).await,
+                };
+                match tokio::net::TcpStream::connect(sa).await {
+                    Ok(s) => (s, false),
+                    Err(e) => {
+                        let _ = client.write_all(format!("HTTP/1.1 502 Bad Gateway\r\n\r\n{e}").as_bytes()).await;
+                        return Ok(());
+                    }
                 }
-            },
+            }
         };
         // Tell the client the tunnel is open (unless the upstream already did,
         // in which case we still must, since the client spoke to us).
@@ -437,6 +729,7 @@ impl Interceptor {
             resp_bytes,
             tunnelled: true,
             content_type: String::new(),
+            denied: false,
         });
         Ok(())
     }
@@ -538,5 +831,171 @@ mod tests {
         assert_eq!(flows[0].status, 200);
         assert!(!flows[0].tunnelled);
         assert!(interceptor.hosts().iter().any(|h| h == &origin_addr.to_string()));
+    }
+}
+#[cfg(test)]
+mod admit_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn scoped() -> Interceptor {
+        Interceptor::new(None)
+            .with_policy(Arc::new(crate::scope::ScopePolicy::for_target(
+                "https://app.example.com",
+            )))
+            .with_resolver(Arc::new(|h: &str| match h {
+                "app.example.com" => vec![ip("93.184.216.34")],
+                _ => vec![ip("203.0.113.10")],
+            }))
+    }
+
+    #[test]
+    fn the_proxy_environment_names_every_variable_and_a_non_wildcard_no_proxy() {
+        let env = ProxyConfig::env_for("http://127.0.0.1:9000");
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        for k in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            assert!(keys.contains(&k), "missing {k} in {keys:?}");
+        }
+        let np = ProxyConfig::no_proxy_value(&["api.anthropic.com".into(), "*".into()]);
+        assert!(np.contains("127.0.0.1"), "{np}");
+        assert!(np.contains("api.anthropic.com"), "{np}");
+        assert!(!np.contains('*'), "no wildcard allowed: {np}");
+        let full = ProxyConfig::env_with_no_proxy(
+            "http://127.0.0.1:9000",
+            &["api.anthropic.com".into()],
+        );
+        assert!(full
+            .iter()
+            .any(|(k, v)| k == "NO_PROXY" && v.contains("api.anthropic.com")));
+    }
+
+    #[test]
+    fn the_admission_table() {
+        let i = scoped();
+        assert_eq!(
+            i.admit("evil.test", 443).unwrap_err(),
+            DenyReason::OutOfScope,
+            "a host the scope never named must be refused"
+        );
+        assert_eq!(
+            i.admit("127.0.0.1", 80).unwrap_err(),
+            DenyReason::PrivateAddress,
+            "loopback is refused even though the policy is silent about it"
+        );
+        assert_eq!(
+            i.admit("2130706433", 80).unwrap_err(),
+            DenyReason::PrivateAddress,
+            "the decimal encoding is the same address and must not slip through"
+        );
+        assert_eq!(
+            i.admit("app.example.com", 443).unwrap(),
+            vec![ip("93.184.216.34")],
+            "an in-scope name returns the pinned address"
+        );
+    }
+
+    #[test]
+    fn a_rebind_to_a_private_address_is_refused_with_its_own_code() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let i = Interceptor::new(None)
+            .with_policy(Arc::new(crate::scope::ScopePolicy::for_target(
+                "https://app.example.com",
+            )))
+            .with_rebind_guard(Arc::new(Mutex::new(crate::netguard::RebindGuard::new())))
+            .with_resolver(Arc::new(move |_h: &str| {
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    vec![ip("93.184.216.34")]
+                } else {
+                    vec![ip("93.184.216.34"), ip("127.0.0.1")]
+                }
+            }));
+        assert_eq!(i.admit("app.example.com", 443).unwrap(), vec![ip("93.184.216.34")]);
+        assert_eq!(
+            i.admit("app.example.com", 443).unwrap_err(),
+            DenyReason::RebindDetected,
+            "a name that gains a private address on re-resolution is a rebind"
+        );
+    }
+
+    #[test]
+    fn out_of_band_and_passthrough_hosts_are_admitted_despite_being_internal() {
+        let i = Interceptor::new(None)
+            .with_policy(Arc::new(crate::scope::ScopePolicy::for_target(
+                "https://app.example.com",
+            )))
+            .with_extras(ExtraAllow {
+                oob_suffixes: vec![".oob.test".into()],
+                passthrough_hosts: vec!["api.anthropic.com".into()],
+            })
+            .with_resolver(Arc::new(|_h: &str| vec![ip("127.0.0.1")]));
+        assert_eq!(i.admit("abc.oob.test", 80).unwrap(), vec![ip("127.0.0.1")]);
+        assert_eq!(i.admit("api.anthropic.com", 443).unwrap(), vec![ip("127.0.0.1")]);
+        assert_eq!(
+            i.admit("other.test", 443).unwrap_err(),
+            DenyReason::OutOfScope,
+            "the extras must not become a general allow"
+        );
+    }
+
+    /// Criterion 7: drive the real listener with a raw request. `admit` is the
+    /// table; this is the proof that the table is consulted on the wire, and
+    /// that a refusal is recorded rather than silently dropped.
+    #[tokio::test]
+    async fn the_wire_refuses_an_out_of_scope_destination_and_records_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let i = Arc::new(scoped());
+        let addr = i.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"GET http://evil.test/ HTTP/1.1\r\nHost: evil.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let _ = sock.read_to_end(&mut buf).await;
+        let text = String::from_utf8_lossy(&buf).to_string();
+
+        assert!(
+            text.starts_with("HTTP/1.1 403"),
+            "an out-of-scope request must be refused at the wire, got: {text}"
+        );
+        assert!(
+            text.contains("OUT_OF_SCOPE"),
+            "the body must name the branch that refused: {text}"
+        );
+        let denied = i.flows().into_iter().filter(|f| f.denied).count();
+        assert_eq!(denied, 1, "the refusal must be recorded as evidence");
+    }
+
+    #[tokio::test]
+    async fn the_wire_refuses_a_connect_to_loopback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let i = Arc::new(scoped());
+        let addr = i.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1:80\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let _ = sock.read_to_end(&mut buf).await;
+        let text = String::from_utf8_lossy(&buf).to_string();
+        assert!(text.starts_with("HTTP/1.1 403"), "got: {text}");
+        assert!(
+            text.contains("PRIVATE_ADDRESS"),
+            "a loopback CONNECT must say why: {text}"
+        );
     }
 }

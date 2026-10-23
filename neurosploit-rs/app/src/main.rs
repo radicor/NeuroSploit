@@ -74,6 +74,11 @@ struct Cli {
     /// http://host:port. Routes the harness AND agent commands through it.
     #[arg(long = "intercept", global = true)]
     intercept: Option<String>,
+    /// How far the run is fenced: scoped (default; egress policy-checked) ·
+    /// isolated (v4.6, refused today) · yolo (explicit — prints the banner and
+    /// turns the scope promise off). Global, so a session cannot farm itself.
+    #[arg(long = "execution-mode", global = true)]
+    execution_mode: Option<String>,
     /// Run agent commands inside a container instead of on the host. Bare flag
     /// uses the Kali image; give a value to override (e.g. --sandbox my/img).
     #[arg(long = "sandbox", global = true, num_args = 0..=1, default_missing_value = "")]
@@ -2293,6 +2298,19 @@ fn apply_network(cfg: &mut RunConfig, cli: &Cli) -> anyhow::Result<()> {
     cfg.oob_http = oob_http;
     cfg.oob_dns = oob_dns;
     cfg.sms = sms;
+    // SEC-010: the CLI flag is the operator's own consent, so `yolo` needs no
+    // second switch here; the HTTP API does, because a caller is not the
+    // operator. `isolated` is refused rather than run as `scoped`.
+    if let Some(raw) = cli.execution_mode.as_deref() {
+        let mode: harness::types::ExecutionMode =
+            raw.parse().map_err(|e: String| anyhow::anyhow!("{e}"))?;
+        let mode = mode.admit(true).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if mode == harness::types::ExecutionMode::Yolo {
+            eprintln!("\x1b[33mSCOPE PROMISE OFF — execution-mode yolo: egress is not policy-checked\x1b[0m");
+        }
+        println!("  \x1b[2mexecution-mode: {}\x1b[0m", mode.as_str());
+        cfg.execution_mode = mode;
+    }
     Ok(())
 }
 

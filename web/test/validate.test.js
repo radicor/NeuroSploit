@@ -12,7 +12,7 @@ const path = require('node:path');
 
 const {
   MODE_ALLOWLIST, checkPositional, safeReplValue, confinePath, resolveRunDir,
-  buildArgs, buildReplScript, materializeCreds, cleanupJobTemp,
+  buildArgs, buildReplScript, materializeCreds, cleanupJobTemp, modeFor, startServer,
 } = require('../server.js');
 
 const is400 = (field) => (e) => {
@@ -28,9 +28,12 @@ test('every legitimate mode still launches (c1 / TN-1)', () => {
     const body = { mode, target: 'http://example.com', repo: 'owner/repo' };
     assert.doesNotThrow(() => buildArgs(body), `mode ${mode} must launch`);
   }
-  // cloud is an alias, not a CLI subcommand
-  assert.deepStrictEqual(buildArgs({ mode: 'cloud', target: 'aws' }).slice(0, 3),
-    ['host', 'aws', '--cloud']);
+  // cloud is an alias, not a CLI subcommand. Assert the alias property rather
+  // than an argv prefix: a global flag can be inserted before the positional.
+  const cloud = buildArgs({ mode: 'cloud', target: 'aws' });
+  assert.strictEqual(cloud[0], 'host', 'cloud must alias host');
+  assert.ok(cloud.includes('--cloud'), 'the cloud switch must be present');
+  assert.ok(!cloud.includes('cloud'), 'cloud must never reach argv as a subcommand');
 });
 
 // ---------------------------------------------------------------- criterion 2
@@ -163,4 +166,48 @@ test('checkPositional trims and reports the field', () => {
   assert.strictEqual(checkPositional('', 'focus').ok, false);
   assert.strictEqual(checkPositional('x'.repeat(5000), 'focus').ok, false, 'length cap');
   assert.strictEqual(checkPositional(undefined, 'focus').ok, false);
+});
+
+// ------------------------------------------------------- SEC-010 criterion 1
+test('the execution mode defaults to scoped and yolo needs the second switch', () => {
+  assert.deepStrictEqual(modeFor(undefined, undefined), { ok: true, mode: 'scoped' });
+  assert.deepStrictEqual(modeFor('', undefined), { ok: true, mode: 'scoped' });
+  assert.strictEqual(modeFor('yolo', undefined).ok, false, 'yolo without acceptUnfenced');
+  assert.deepStrictEqual(modeFor('yolo', true), { ok: true, mode: 'yolo' });
+  assert.strictEqual(modeFor('isolated', true).ok, false, 'isolated is refused, not downgraded');
+  assert.strictEqual(modeFor('nope').ok, false);
+});
+
+test('the validated mode reaches the launch argv', () => {
+  const plain = buildArgs({ mode: 'run', target: 'http://example.com' });
+  const i = plain.indexOf('--execution-mode');
+  assert.ok(i > -1, 'the launch must carry the mode');
+  assert.strictEqual(plain[i + 1], 'scoped', 'omitting the field must launch scoped');
+
+  const yolo = buildArgs({
+    mode: 'run', target: 'http://example.com', executionMode: 'yolo', acceptUnfenced: true,
+  });
+  assert.strictEqual(yolo[yolo.indexOf('--execution-mode') + 1], 'yolo');
+
+  assert.throws(
+    () => buildArgs({ mode: 'run', target: 'http://example.com', executionMode: 'yolo' }),
+    is400('executionMode'),
+    'a yolo build with no consent must refuse, not default',
+  );
+});
+
+test('POST /api/exploit refuses a forged mode before any job exists', async () => {
+  const srv = await startServer({ port: 0 });
+  try {
+    const post = (body) => fetch(`${srv.url}/api/exploit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const yolo = await post({ mode: 'run', target: 'http://example.com', executionMode: 'yolo' });
+    assert.strictEqual(yolo.status, 400, 'yolo without acceptUnfenced must be 400');
+    assert.strictEqual((await yolo.json()).field, 'executionMode');
+
+    const iso = await post({ mode: 'run', target: 'http://example.com', executionMode: 'isolated' });
+    assert.strictEqual(iso.status, 400, 'isolated must be refused, never accepted-and-ignored');
+    assert.match((await iso.json()).error, /v4\.6/);
+  } finally { await srv.close(); }
 });

@@ -1494,6 +1494,22 @@ function ingestLine(job, rawLine) {
   }
 }
 
+/// SEC-010 criterion 1: the run's fencing mode. `scoped` is the default, so a
+/// client that omits the field gets the fenced mode rather than the convenient
+/// one. `yolo` needs the caller's second, explicit switch because a client is
+/// not the operator; `isolated` is refused instead of silently downgraded.
+function modeFor(raw, acceptUnfenced) {
+  const m = raw === undefined || raw === null || raw === '' ? 'scoped' : String(raw).toLowerCase();
+  if (!['scoped', 'isolated', 'yolo'].includes(m)) {
+    return { ok: false, error: `executionMode must be scoped | isolated | yolo, got \`${m}\`` };
+  }
+  if (m === 'isolated') return { ok: false, error: 'isolated is not implemented until v4.6' };
+  if (m === 'yolo' && acceptUnfenced !== true) {
+    return { ok: false, error: 'yolo requires acceptUnfenced: true' };
+  }
+  return { ok: true, mode: m };
+}
+
 function buildArgs(body) {
   const rawMode = body.mode || 'run';
   if (!MODE_ALLOWLIST.has(rawMode)) {
@@ -1501,6 +1517,11 @@ function buildArgs(body) {
   }
   const mode = rawMode === 'cloud' ? 'host' : rawMode;
   const args = [mode];
+  // The mode the console validated is the mode the binary receives; a
+  // validated-then-dropped value would be decoration, not a boundary.
+  const execMode = modeFor(body.executionMode, body.acceptUnfenced);
+  if (!execMode.ok) throw badInput('executionMode', execMode.error);
+  args.push('--execution-mode', execMode.mode);
 
   // Free-text values become argv elements, so a leading '-' would turn one into
   // a flag. Paths additionally have to resolve inside an allowed root.
@@ -2660,6 +2681,9 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && p === '/api/exploit') {
       const body = await readBody(req);
+      // SEC-010 criterion 1: refuse before a job exists, and name the field.
+      const execMode = modeFor(body.executionMode, body.acceptUnfenced);
+      if (!execMode.ok) return sendJson(res, 400, { error: execMode.error, field: 'executionMode' });
       const key = idempotencyKey(req);
       const idem = await withIdempotency(key, bodyDigest(body), async () => {
         // Without a key, a second launch of the same target is a mistake worth
@@ -3225,6 +3249,7 @@ module.exports = {
   securityHeaders, hostAllowed, originAllowed, enforceJsonType, rateLimit,
   REPL_COMMANDS, OPERATOR_COMMANDS, classifyStdinLine, gateStdin,
   idempotencyKey, bodyDigest, withIdempotency, duplicateLaunch, withConfigLock, pruneJobs, mutateConfig,
+  modeFor,
   tierFor, tierRuleFor, redactSecret, redactEntry, isMasked, unmaskOnWrite, requireConfirm, redactIntegration, redactVault, unmaskVault,
   materializeCreds, cleanupJobTemp,
 };

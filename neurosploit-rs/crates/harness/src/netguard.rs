@@ -166,6 +166,19 @@ impl RebindGuard {
     /// name that resolves (now or ever) to a private address.
     pub fn check(&mut self, host: &str) -> Result<Vec<IpAddr>, String> {
         let now = resolve(host);
+        self.check_with(host, now)
+    }
+
+    /// Whether this host has been resolved before, so a caller can tell a
+    /// rebind from a first-sight private target.
+    pub fn seen(&self, host: &str) -> bool {
+        self.first.contains_key(host)
+    }
+
+    /// The same decision over an already-resolved list, so a caller that must
+    /// pin the addresses it vets (the proxy choke) and a test can both drive
+    /// this logic without a second DNS lookup.
+    pub fn check_with(&mut self, host: &str, now: Vec<IpAddr>) -> Result<Vec<IpAddr>, String> {
         if now.is_empty() {
             return Err(format!("{host} does not resolve — refusing rather than guessing"));
         }
@@ -193,6 +206,33 @@ impl RebindGuard {
             }
         }
     }
+}
+
+/// Resolve a host and refuse anything that lands on a private address.
+///
+/// `redirect_allowed` deliberately stays policy-only: a redirect target has to
+/// be resolved *before* it can be judged, and this is that step. Without it a
+/// hostname pointing at loopback is followed exactly like a literal would be.
+pub fn pin(host: &str) -> Result<Vec<IpAddr>, String> {
+    let host = normalize_host(host);
+    if host.is_empty() {
+        return Err("redirect has no host".into());
+    }
+    if let Some(ip) = parse_ip_any(&host) {
+        return if is_private(&ip) {
+            Err(format!("{host} is a private address — not followed"))
+        } else {
+            Ok(vec![ip])
+        };
+    }
+    let ips = resolve(&host);
+    if ips.is_empty() {
+        return Err(format!("{host} does not resolve — refusing rather than guessing"));
+    }
+    if let Some(bad) = ips.iter().find(|ip| is_private(ip)) {
+        return Err(format!("{host} resolves to a private address ({bad}) — not followed"));
+    }
+    Ok(ips)
 }
 
 /// Validate a redirect target before following it.
@@ -236,6 +276,19 @@ fn resolve_relative(base: &str, location: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pin_refuses_a_hostname_that_resolves_to_loopback() {
+        // `localhost` resolves to loopback by name; only resolution can see it,
+        // which is why `pin` exists next to the policy-only redirect check.
+        for i in 0..50 {
+            let got = pin("localhost");
+            assert!(
+                got.is_err(),
+                "iteration {i}: pin(localhost) returned {got:?} instead of refusing"
+            );
+        }
+    }
 
     #[test]
     fn every_encoding_of_loopback_normalizes_the_same() {

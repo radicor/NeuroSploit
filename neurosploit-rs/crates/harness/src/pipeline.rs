@@ -99,8 +99,8 @@ OPERATOR AUTHORIZATION ATTESTATION:\n\
 • The operator (a credentialed security professional) has attested written \
   authorization for this engagement BEFORE invoking you.\n\
 • Scope boundaries are ENFORCED IN CODE by the harness at the network layer — \
-  every outbound request is validated against the scope guard; out-of-scope \
-  traffic is blocked programmatically, not by prompt text.\n\
+  egress is routed through a policy-checked choke and out-of-scope traffic is \
+  refused programmatically, not by prompt text.\n\
 • The target, scope entries, and any program reference (VDP, bug-bounty, \
   penetration-test contract) were configured by the operator, who bears legal \
   and professional responsibility for the engagement.\n\
@@ -119,6 +119,16 @@ RULES OF ENGAGEMENT:\n\
 • Do NOT stop after one round claiming authorization is unverifiable — the \
   harness enforces scope in code; operate within it.\n\
 \n";
+
+/// The authorization preamble for a run's mode. `yolo` gets nothing: the
+/// operator turned the scope promise off, and printing it anyway would be the
+/// exact lie this spec exists to remove.
+fn authorization_preamble(mode: crate::types::ExecutionMode) -> &'static str {
+    match mode {
+        crate::types::ExecutionMode::Yolo => "",
+        _ => AUTHORIZATION_PREAMBLE,
+    }
+}
 
 const RECON_SYS: &str = "You are an elite web recon specialist on an AUTHORIZED engagement. Actively fetch the target with your tools and map the REAL attack surface in DEPTH — do not ask for permission, proceed:\n\
 - Crawl pages, forms and parameters; record every input, header, cookie and redirect.\n\
@@ -172,7 +182,7 @@ fn operator_directives(cfg: &RunConfig) -> String {
     // operator-declared; the harness enforces the boundary.
     let has_scope = !cfg.scope.hard.is_empty() || !cfg.target.is_empty();
     if has_scope {
-        s.push_str(AUTHORIZATION_PREAMBLE);
+        s.push_str(authorization_preamble(cfg.execution_mode));
     }
     if let Some(a) = cfg.authorization.as_deref().filter(|x| !x.trim().is_empty()) {
         s.push_str(&format!("PROGRAM REFERENCE: {a}\n"));
@@ -1033,6 +1043,115 @@ async fn authz_matrix_pass(cfg: &RunConfig, recon: &str, tx: &Sender<String>) ->
     .await
 }
 
+/// Start the egress choke (SEC-010 criteria 2–3).
+///
+/// In `scoped`/`isolated` the own interceptor **always** starts: a bare
+/// `--intercept burp` becomes its upstream rather than a replacement, and a
+/// bind failure is a refusal, not a warning. A run that silently lost its choke
+/// would still print the scope promise, which is the defect this prevents.
+async fn prepare_choke(
+    cfg: &RunConfig,
+    tx: &Sender<String>,
+) -> Result<Option<String>, RunOutput> {
+    use crate::types::ExecutionMode;
+    let fenced = matches!(
+        cfg.execution_mode,
+        ExecutionMode::Scoped | ExecutionMode::Isolated
+    );
+    let spec = cfg.intercept.as_deref().filter(|s| !s.trim().is_empty());
+    let parsed = match spec {
+        Some(sp) => match crate::proxy::ProxyConfig::parse(sp) {
+            Ok(pc) => Some(pc),
+            // In a fenced mode an unparseable spec is a refusal: the operator
+            // asked for a choke and we cannot honour what they asked for.
+            Err(e) if fenced => {
+                return Err(aborted_with(
+                    cfg,
+                    Some(format!("DENY_EGRESS_CHOKE_UNAVAILABLE: intercept `{sp}`: {e}")),
+                ))
+            }
+            Err(e) => {
+                let _ = tx.send(format!("notify: ⚠ intercept: {e} — no interception")).await;
+                None
+            }
+        },
+        None => None,
+    };
+
+    if !fenced {
+        // `yolo`: the operator turned the promise off. An explicit tool is still
+        // honoured, but nothing here claims a choke.
+        if let Some(pc) = parsed {
+            if let Some(t) = &pc.upstream {
+                if !t.is_listening().await {
+                    let _ = tx
+                        .send(format!(
+                            "notify: ⚠ {} is configured but nothing is listening at {} — start it or requests will fail",
+                            t.name(),
+                            t.proxy_url()
+                        ))
+                        .await;
+                }
+            }
+            if let Some(url) = pc.client_proxy_url() {
+                let _ = tx.send(format!("notify: 🕵 {}", pc.summary())).await;
+                return Ok(Some(url));
+            }
+        }
+        return Ok(None);
+    }
+
+    let pc = parsed.unwrap_or_default();
+    // A bare tool is the upstream; the choke binds its own ephemeral port so two
+    // runs cannot collide on 8899.
+    let bind = if pc.own_interceptor {
+        pc.bind
+    } else {
+        "127.0.0.1:0".parse().expect("loopback literal")
+    };
+    let upstream = pc.upstream.as_ref().map(|t| t.proxy_url());
+    // The policy is what makes this a choke rather than a recorder: without it
+    // the listener would admit anything, which is the audit's H10 exactly.
+    let extras = crate::proxy::ExtraAllow {
+        oob_suffixes: cfg
+            .oob_domain
+            .as_deref()
+            .map(|d| vec![format!(".{d}")])
+            .unwrap_or_default(),
+        passthrough_hosts: Vec::new(),
+    };
+    let mut interceptor = crate::proxy::Interceptor::new(upstream)
+        .with_policy(std::sync::Arc::new(cfg.scope.clone()))
+        .with_rebind_guard(std::sync::Arc::new(std::sync::Mutex::new(
+            crate::netguard::RebindGuard::new(),
+        )))
+        .with_extras(extras);
+    if let Some(j) = cfg
+        .workdir
+        .as_deref()
+        .map(|d| format!("{}/flows.jsonl", d.trim_end_matches('/')))
+    {
+        interceptor = interceptor.logging_to(j);
+    }
+    let addr = interceptor.listen(bind).await.map_err(|e| {
+        aborted_with(
+            cfg,
+            Some(format!(
+                "DENY_EGRESS_CHOKE_UNAVAILABLE: own interceptor could not bind {bind}: {e}"
+            )),
+        )
+    })?;
+    let via = pc
+        .upstream
+        .as_ref()
+        .map(|t| format!(" → {}", t.name()))
+        .unwrap_or_default();
+    let _ = tx
+        .send(format!("notify: 🕵 egress choke on {addr}{via}"))
+        .await;
+    Ok(Some(format!("http://{addr}")))
+}
+
 pub async fn run(mut cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender<String>) -> RunOutput {
     // Route the operator's --auth value into the vault before any prompt is
     // built, so `operator_directives` has a reference to print.
@@ -1211,39 +1330,29 @@ pub async fn run(mut cfg: RunConfig, lib: &Library, pool: &ModelPool, tx: Sender
         }
     }
 
-    // Intercepting proxy. Whether it is Burp, an own recording interceptor, or
-    // both, the effect is one env var the reqwest client already honours, plus
-    // the same var exported to agent child commands — so the whole engagement
-    // flows through one point the operator can watch and replay.
-    if let Some(spec) = cfg.intercept.as_deref().filter(|s| !s.trim().is_empty()) {
-        match crate::proxy::ProxyConfig::parse(spec) {
-            Ok(pc) => {
-                if pc.own_interceptor {
-                    let jsonl = cfg.workdir.as_deref().map(|d| format!("{}/flows.jsonl", d.trim_end_matches('/')));
-                    let upstream = pc.upstream.as_ref().map(|t| t.proxy_url());
-                    let mut interceptor = crate::proxy::Interceptor::new(upstream);
-                    if let Some(j) = jsonl { interceptor = interceptor.logging_to(j); }
-                    match interceptor.listen(pc.bind).await {
-                        Ok(()) => { let _ = tx.send(format!("notify: 🕵 {}", pc.summary())).await; }
-                        Err(e) => { let _ = tx.send(format!("notify: ⚠ own interceptor did not bind ({e}) — routing direct")).await; }
-                    }
-                } else if let Some(t) = &pc.upstream {
-                    // A bare tool: warn if it is not actually listening rather
-                    // than failing every request three minutes in.
-                    if !t.is_listening().await {
-                        let _ = tx.send(format!("notify: ⚠ {} is configured but nothing is listening at {} — start it or requests will fail", t.name(), t.proxy_url())).await;
-                    } else {
-                        let _ = tx.send(format!("notify: 🕵 {}", pc.summary())).await;
-                    }
-                }
-                if let Some(url) = pc.client_proxy_url() {
-                    // The reqwest client (probe + replay) reads this; child
-                    // commands get it through the process environment.
-                    std::env::set_var("NEUROSPLOIT_PROXY", &url);
-                    for (k, v) in pc.env() { std::env::set_var(k, v); }
-                }
-            }
-            Err(e) => { let _ = tx.send(format!("notify: ⚠ intercept: {e} — routing direct")).await; }
+    // Egress choke (SEC-010). In `scoped`/`isolated` it always starts; a bind
+    // failure aborts the run rather than falling back to a direct route, because
+    // silently lost its choke would still print the scope promise in its report.
+    let proxy_url = match prepare_choke(&cfg, &tx).await {
+        Ok(url) => url,
+        // The refusal arrives as a finished `RunOutput`, so this site can only
+        // return it — there is no value here a caller could carry on with.
+        Err(refusal) => return refusal,
+    };
+    if let Some(url) = proxy_url {
+        // The reqwest client (probe + replay) reads this; child commands get it
+        // through the process environment.
+        std::env::set_var("NEUROSPLOIT_PROXY", &url);
+        // Providers are reached directly, not through the choke: their hosts go
+        // in NO_PROXY so the harness's own model calls are not refused by its
+        // own egress guard.
+        let provider_hosts: Vec<String> = crate::models::providers()
+            .iter()
+            .map(|pr| crate::scope::host_of(&pr.base_url))
+            .filter(|h| !h.is_empty())
+            .collect();
+        for (k, v) in crate::proxy::ProxyConfig::env_with_no_proxy(&url, &provider_hosts) {
+            std::env::set_var(k, v);
         }
     }
 
@@ -6272,5 +6381,100 @@ mod recon_shell_tests {
 
         let many: Vec<String> = (0..500).map(|i| format!("https://example.com/{i:04}")).collect();
         assert_eq!(merge_harvest(many).len(), 400, "harvest must stay capped at 400");
+    }
+}
+
+#[cfg(test)]
+mod egress_choke_tests {
+    use super::*;
+    use crate::types::ExecutionMode;
+
+    fn cfg_with(spec: Option<&str>, mode: ExecutionMode) -> RunConfig {
+        let mut cfg = RunConfig::new("https://example.com");
+        cfg.execution_mode = mode;
+        cfg.intercept = spec.map(|s| s.to_string());
+        cfg
+    }
+
+    #[tokio::test]
+    async fn a_choke_that_cannot_bind_aborts_the_run() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = occupied.local_addr().unwrap();
+        let cfg = cfg_with(Some(&format!("own@{addr}")), ExecutionMode::Scoped);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let refusal = match prepare_choke(&cfg, &tx).await {
+            Ok(_) => panic!("a bind failure must not produce a runnable choke"),
+            Err(refusal) => refusal,
+        };
+        let code = refusal.denied.clone().unwrap_or_default();
+        assert!(
+            code.starts_with("DENY_EGRESS_CHOKE_UNAVAILABLE"),
+            "the refusal returned to `run` must carry the code the caller exits on: {code}"
+        );
+        assert!(
+            !code.contains("routing direct"),
+            "a refusal must not offer a direct fallback: {code}"
+        );
+        assert!(
+            refusal.findings.is_empty(),
+            "a refused run must not look like a clean zero-finding run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scoped_run_always_starts_a_choke_and_exports_the_bound_address() {
+        let cfg = cfg_with(None, ExecutionMode::Scoped);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let url = match prepare_choke(&cfg, &tx).await {
+            Ok(url) => url.expect("scoped must start a choke even with no --intercept"),
+            Err(_) => panic!("a scoped run must start a choke, not refuse"),
+        };
+        assert!(url.starts_with("http://127.0.0.1:"), "got {url}");
+        assert!(
+            !url.ends_with(":0"),
+            "port 0 must be resolved before the URL is exported: {url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn yolo_does_not_start_a_choke() {
+        let cfg = cfg_with(None, ExecutionMode::Yolo);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        assert!(matches!(prepare_choke(&cfg, &tx).await, Ok(None)));
+    }
+}
+#[cfg(test)]
+mod preamble_mode_tests {
+    use super::*;
+    use crate::types::ExecutionMode;
+
+    #[test]
+    fn the_scoped_preamble_does_not_overclaim_and_yolo_has_none() {
+        let scoped = authorization_preamble(ExecutionMode::Scoped);
+        assert!(!scoped.is_empty());
+        assert!(
+            !scoped.contains("every outbound request"),
+            "the scoped preamble still claims universal interception"
+        );
+        assert!(authorization_preamble(ExecutionMode::Yolo).is_empty());
+
+        let cfg = RunConfig::new("https://app.example.com");
+        let prompts = operator_directives(&cfg);
+        assert!(prompts.contains("AUTHORIZATION CONTEXT"));
+        assert!(!prompts.contains("every outbound request"));
+
+        let mut yolo = RunConfig::new("https://app.example.com");
+        yolo.execution_mode = ExecutionMode::Yolo;
+        assert!(
+            !operator_directives(&yolo).contains("AUTHORIZATION CONTEXT"),
+            "yolo must not receive the authorization preamble"
+        );
+    }
+
+    #[test]
+    fn the_scope_block_makes_the_same_claim_the_guard_does() {
+        let block = crate::scope::ScopePolicy::for_target("https://app.example.com").prompt_block();
+        assert!(!block.contains("every outbound request"));
+        assert!(block.contains("in scope"));
     }
 }
