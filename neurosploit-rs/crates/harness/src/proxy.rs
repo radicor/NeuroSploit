@@ -328,8 +328,15 @@ fn split_host_port(s: &str) -> (String, u16) {
 fn host_port_from_url(url: &str) -> (String, u16) {
     let after = url.split("://").nth(1).unwrap_or(url);
     let authority = after.split(['/', '?', '#']).next().unwrap_or(after);
-    let (host, port) = split_host_port(authority);
-    (host, if port == 443 { 80 } else { port })
+    // An explicit port is honoured whatever the scheme; only a *missing* one
+    // takes the plain-HTTP default. `split_host_port` cannot tell ":443" from
+    // "no port" because it defaults to 443, so the decision is made here.
+    let explicit = authority
+        .rsplit_once(':')
+        .map(|(_, p)| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or(false);
+    let (host, _) = split_host_port(authority);
+    (host, if explicit { split_host_port(authority).1 } else { 80 })
 }
 
 /// The running own interceptor: a recording forward proxy.
@@ -626,6 +633,30 @@ impl Interceptor {
                     rb = rb.header(k, v.trim());
                 }
             }
+        }
+
+        // Forward the request body. `serve` read the head byte-by-byte up to
+        // the blank line, so the body is still on the socket. Bounded, so a
+        // lying content-length cannot exhaust memory or hang the proxy.
+        if let Some(len) = head.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                v.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        }) {
+            const MAX_BODY: usize = 8 * 1024 * 1024;
+            if len > MAX_BODY {
+                let _ = client
+                    .write_all(b"HTTP/1.1 413 Payload Too Large\r\nconnection: close\r\n\r\n")
+                    .await;
+                return Ok(());
+            }
+            let mut body = vec![0u8; len];
+            client.read_exact(&mut body).await?;
+            req_bytes += body.len();
+            rb = rb.body(body);
         }
 
         let now = now();
@@ -996,6 +1027,124 @@ mod admit_tests {
         assert!(
             text.contains("PRIVATE_ADDRESS"),
             "a loopback CONNECT must say why: {text}"
+        );
+    }
+}
+#[cfg(test)]
+mod forwarding_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn an_explicit_port_is_honoured_on_a_plain_http_url() {
+        // The old code rewrote 443 to 80, so `http://host:443/` silently
+        // connected to the wrong service.
+        assert_eq!(host_port_from_url("http://host:443/x"), ("host".to_string(), 443));
+        assert_eq!(host_port_from_url("http://host:8080/x"), ("host".to_string(), 8080));
+        assert_eq!(host_port_from_url("http://host/x"), ("host".to_string(), 80));
+        assert_eq!(host_port_from_url("http://host:80/x"), ("host".to_string(), 80));
+    }
+
+    /// C3 — the dial uses the address `admit` vetted. The target name does not
+    /// resolve at all (`.invalid`), so a second lookup cannot succeed: only the
+    /// pinned address can reach the origin.
+    #[tokio::test]
+    async fn the_forwarder_dials_the_admitted_address_not_a_fresh_lookup() {
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = origin.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok(Ok((mut sock, _))) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), origin.accept()).await
+            {
+                let mut b = [0u8; 1024];
+                let _ = sock.read(&mut b).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\nPINNED")
+                    .await;
+            }
+        });
+
+        let policy = Arc::new(crate::scope::ScopePolicy::for_target(&format!(
+            "http://choke-test.invalid:{port}/"
+        )));
+        let i = Arc::new(
+            Interceptor::new(None)
+                .with_policy(policy)
+                .with_resolver(Arc::new(|_h: &str| vec!["127.0.0.1".parse().unwrap()])),
+        );
+        let addr = i.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!("GET http://choke-test.invalid:{port}/p HTTP/1.1\r\nHost: choke-test.invalid:{port}\r\n\r\n");
+        c.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = c.read_to_end(&mut buf).await;
+        let text = String::from_utf8_lossy(&buf).to_string();
+
+        assert!(
+            text.contains("PINNED"),
+            "the forwarder must dial the admitted address — .invalid cannot resolve, so a second lookup would fail: {text}"
+        );
+    }
+
+    /// C4 — asserted at the upstream, because a dropped body is invisible
+    /// downstream: the proxy still returns the origin's 200.
+    #[tokio::test]
+    async fn a_post_body_crosses_the_choke_intact() {
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = origin.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok(Ok((mut sock, _))) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), origin.accept()).await
+            {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 512];
+                loop {
+                    let n = match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        sock.read(&mut chunk),
+                    )
+                    .await
+                    {
+                        Ok(Ok(n)) => n,
+                        _ => break,
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    // Head plus the three body bytes is enough for this test.
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.ends_with(b"a=1") {
+                        break;
+                    }
+                }
+                let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                    .await;
+            }
+        });
+
+        let policy = Arc::new(crate::scope::ScopePolicy::for_target(&format!(
+            "http://127.0.0.1:{port}/"
+        )));
+        let i = Arc::new(Interceptor::new(None).with_policy(policy));
+        let addr = i.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "POST http://127.0.0.1:{port}/p HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\ncontent-length: 3\r\n\r\na=1"
+        );
+        c.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        let _ = c.read_to_end(&mut resp).await;
+
+        let seen = rx.await.expect("the origin must have been reached");
+        assert!(
+            seen.contains("a=1"),
+            "the origin must receive the request body intact, saw: {seen}"
         );
     }
 }

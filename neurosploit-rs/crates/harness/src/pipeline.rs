@@ -1146,7 +1146,10 @@ async fn prepare_choke(
         passthrough_hosts: Vec::new(),
     };
     let mut interceptor = crate::proxy::Interceptor::new(upstream)
-        .with_policy(std::sync::Arc::new(cfg.scope.clone()))
+        // The choke must judge the scope the run actually uses: `effective_scope`
+        // folds the target in, which `cfg.scope` does not, so a plain run would
+        // otherwise deny its own traffic.
+        .with_policy(std::sync::Arc::new(effective_scope(cfg)))
         .with_rebind_guard(std::sync::Arc::new(std::sync::Mutex::new(
             crate::netguard::RebindGuard::new(),
         )))
@@ -1173,6 +1176,15 @@ async fn prepare_choke(
         .unwrap_or_default();
     let _ = tx
         .send(format!("notify: 🕵 egress choke on {addr}{via}"))
+        .await;
+    // C5 — the bypass is named rather than implied. NO_PROXY keeps loopback off
+    // the choke because the run's own OOB listener lives there; the consequence
+    // is that a child fetching 127.0.0.1 directly is not mediated, so it is said
+    // out loud at start instead of being discovered in an incident.
+    let _ = tx
+        .send(format!(
+            "notify: ⚠ loopback egress bypasses the choke (NO_PROXY): child fetches to 127.0.0.1/localhost are not mediated by {addr}"
+        ))
         .await;
     Ok(Some(format!("http://{addr}")))
 }
@@ -6555,5 +6567,156 @@ mod oob_bind_tests {
         let (addr, warn) = oob_bind(&cfg);
         assert!(addr.ip().is_loopback(), "a typo must not widen the listener");
         assert!(warn.is_none());
+    }
+}
+#[cfg(test)]
+mod effective_scope_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// C1 — the allow direction, which the whole battery lacked. A request the
+    /// run is supposed to make must travel through the started choke and arrive
+    /// at the origin. Asserting the returned proxy URL (the only prior test)
+    /// says nothing about delivery.
+    #[tokio::test]
+    async fn a_default_scoped_run_delivers_its_own_target_through_the_choke() {
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = origin.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), origin.accept()).await {
+                    Ok(Ok((mut sock, _))) => {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        let mut b = [0u8; 1024];
+                        let _ = sock.read(&mut b).await;
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 9\r\nconnection: close\r\n\r\nMARKER-OK")
+                            .await;
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // A plain run: target only, no --in-scope. This is the shape that broke.
+        let cfg = RunConfig::new(&format!("http://127.0.0.1:{port}/"));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let url = match prepare_choke(&cfg, &tx).await {
+            Ok(u) => u.expect("scoped runs start a choke"),
+            Err(_) => panic!("a default-scoped run must not refuse to start"),
+        };
+        let choke: std::net::SocketAddr = url.trim_start_matches("http://").parse().unwrap();
+
+        let mut c = tokio::net::TcpStream::connect(choke).await.unwrap();
+        let req = format!(
+            "GET http://127.0.0.1:{port}/probe HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        );
+        c.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = c.read_to_end(&mut buf).await;
+        let text = String::from_utf8_lossy(&buf).to_string();
+
+        assert!(
+            text.starts_with("HTTP/1.1 200"),
+            "the run's own target must be delivered through the choke, got: {text}"
+        );
+        assert!(
+            text.contains("MARKER-OK"),
+            "the origin's body must come back, got: {text}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the origin must have received exactly one request"
+        );
+    }
+
+    /// C5 — the loopback exemption is stated, not implied.
+    #[tokio::test]
+    async fn the_choke_names_the_loopback_bypass() {
+        let cfg = RunConfig::new("http://127.0.0.1:9/");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let _ = match prepare_choke(&cfg, &tx).await {
+            Ok(u) => u.expect("choke starts"),
+            Err(_) => panic!("must not refuse"),
+        };
+        drop(tx);
+        let mut seen = String::new();
+        while let Some(m) = rx.recv().await {
+            seen.push_str(&m);
+            seen.push('\n');
+        }
+        let low = seen.to_lowercase();
+        assert!(low.contains("loopback"), "the bypass must be named: {seen}");
+        assert!(
+            low.contains("not mediated") || low.contains("bypasses the choke"),
+            "the consequence must be stated: {seen}"
+        );
+    }
+
+    /// TN-1 — folding is a default, not an override. A run the operator
+    /// configured keeps exactly that scope; the target is not silently added.
+    #[test]
+    fn an_explicitly_configured_scope_is_not_replaced_by_the_target() {
+        let mut cfg = RunConfig::new("http://target.example/");
+        cfg.scope
+            .hard
+            .push(crate::scope::Pattern::parse("operator.example").expect("pattern"));
+        let eff = effective_scope(&cfg);
+        assert!(
+            eff.check_connect("operator.example", 443).allowed(),
+            "the operator's entry must survive"
+        );
+        assert!(
+            !eff.check_connect("target.example", 443).allowed(),
+            "the target must not be auto-authorized when the operator configured a scope"
+        );
+    }
+
+    /// TN-2 — the fold must not defeat an explicit exclusion.
+    #[test]
+    fn an_out_of_scope_token_still_denies_the_folded_target() {
+        let mut cfg = RunConfig::new("http://target.example/");
+        cfg.out_of_scope = Some("target.example".into());
+        let eff = effective_scope(&cfg);
+        assert!(
+            !eff.check_connect("target.example", 443).allowed(),
+            "an out_of_scope token must beat the folded target"
+        );
+    }
+
+    /// C2 — the refusal is held. Folding the target into the choke's scope must
+    /// not turn a deny-all into an allow-all: a host the run never named is
+    /// still refused, through the same started choke.
+    #[tokio::test]
+    async fn a_default_scoped_run_still_refuses_a_non_target_host() {
+        let cfg = RunConfig::new("http://127.0.0.1:9/");
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let url = match prepare_choke(&cfg, &tx).await {
+            Ok(u) => u.expect("scoped runs start a choke"),
+            Err(_) => panic!("must not refuse to start"),
+        };
+        let choke: std::net::SocketAddr = url.trim_start_matches("http://").parse().unwrap();
+
+        let mut c = tokio::net::TcpStream::connect(choke).await.unwrap();
+        c.write_all(b"GET http://evil.test/ HTTP/1.1\r\nHost: evil.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let _ = c.read_to_end(&mut buf).await;
+        let text = String::from_utf8_lossy(&buf).to_string();
+
+        assert!(
+            text.starts_with("HTTP/1.1 403"),
+            "a host outside the effective scope must be refused, got: {text}"
+        );
+        assert!(
+            text.contains("OUT_OF_SCOPE"),
+            "the refusal must name the branch, got: {text}"
+        );
     }
 }
