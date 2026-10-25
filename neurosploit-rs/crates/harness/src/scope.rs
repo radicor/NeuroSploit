@@ -339,6 +339,12 @@ pub struct ScopePolicy {
     pub exclude: Vec<Pattern>,
     #[serde(default)]
     pub soft: SoftScope,
+    /// Hosts a human named with `--in-scope`. Deliberately separate from
+    /// `hard`: `for_target` puts the target there automatically, so membership
+    /// in `hard` says nothing about operator intent. Only this list may exempt
+    /// a host from the private-address refusal on a redirect.
+    #[serde(default)]
+    pub explicit: Vec<Pattern>,
     /// Rolling request timestamps for the rate guard.
     #[serde(skip)]
     ledger: Mutex<VecDeque<std::time::Instant>>,
@@ -352,6 +358,7 @@ impl Clone for ScopePolicy {
             hard: self.hard.clone(),
             exclude: self.exclude.clone(),
             soft: self.soft.clone(),
+            explicit: self.explicit.clone(),
             ledger: Mutex::new(VecDeque::new()),
             accounts: std::sync::atomic::AtomicU32::new(self.accounts.load(std::sync::atomic::Ordering::Relaxed)),
         }
@@ -372,6 +379,23 @@ impl ScopePolicy {
             p.hard.push(pat);
         }
         p
+    }
+
+    /// Mark a host as explicitly authorized by the operator. Separate from
+    /// `hard` on purpose: this is intent, `hard` is reachability.
+    pub fn authorize_explicitly(&mut self, host: &str) {
+        // Parse the *host*, as `for_target` does: an `--in-scope` entry is a URL,
+        // and a pattern built from the whole URL never matches a host.
+        if let Some(pat) = Pattern::parse(&host_of(host)) {
+            self.explicit.push(pat);
+        }
+    }
+
+    /// Whether a human named this host (not merely whether it is in `hard`).
+    pub fn explicitly_authorized(&self, host: &str) -> bool {
+        self.explicit
+            .iter()
+            .any(|pat| pat.matches(&format!("https://{host}/")))
     }
 
     /// Add allowlist entries from operator text (comma/space/newline separated).
@@ -814,6 +838,7 @@ fn unquote(s: &str) -> String {
 fn truthy(s: &str) -> bool {
     matches!(s.trim().to_lowercase().as_str(), "true" | "yes" | "on" | "1")
 }
+
 
 #[cfg(test)]
 mod tests {

@@ -105,8 +105,14 @@ pub struct ReplayEngine {
 
 impl ReplayEngine {
     pub fn new(policy: ScopePolicy) -> Self {
+        // The engine's client must know the policy: checking only the initial
+        // URL leaves every redirect unguarded.
+        let client = crate::probe::client_for(
+            Some(std::sync::Arc::new(policy.clone())),
+            false,
+        );
         ReplayEngine {
-            client: crate::probe::http_client(),
+            client,
             policy,
             pace: Duration::from_millis(350),
             vault: crate::vault::Vault::default(),
@@ -122,7 +128,11 @@ impl ReplayEngine {
     /// Use a client that never proxies. Loopback tests must call this: a stray
     /// `NEUROSPLOIT_PROXY` would send the request at the proxy instead of the mock.
     pub fn no_proxy(mut self) -> Self {
-        self.client = crate::probe::http_client_direct();
+        // Keep the policy: the loopback seam must not drop the guard it tests.
+        self.client = crate::probe::client_for_direct(
+            Some(std::sync::Arc::new(self.policy.clone())),
+            false,
+        );
         self
     }
 
@@ -747,5 +757,144 @@ mod effect_tests {
         for l in [EffectLayer::Request, EffectLayer::Application, EffectLayer::External] {
             assert!(!report.observed(l), "{l:?} must not be reported as observed when nothing was sent");
         }
+    }
+}
+#[cfg(test)]
+mod redirect_scope_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn canary() -> (u16, Arc<AtomicUsize>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), l.accept()).await {
+                    Ok(Ok((mut sock, _))) => {
+                        let mut b = [0u8; 1024];
+                        let n = sock.read(&mut b).await.unwrap_or(0);
+                        let head = String::from_utf8_lossy(&b[..n]).to_lowercase();
+                        // Count only the redirect's own request: a bare accept
+                        // count picks up environment scanners (SEC-008 lesson).
+                        if head.contains("/moved") {
+                            h.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nHIT")
+                            .await;
+                    }
+                    _ => break,
+                }
+            }
+        });
+        (port, hits)
+    }
+
+    async fn origin_redirecting_to(location: String) -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok(Ok((mut sock, _))) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), l.accept()).await
+            {
+                let mut b = [0u8; 2048];
+                let _ = sock.read(&mut b).await;
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        port
+    }
+
+    /// C1 — a redirect to a hostname that resolves to loopback is not followed.
+    /// The target is a NAME, so the old literal-only guard could not have
+    /// stopped it; only resolution can.
+    #[tokio::test]
+    async fn a_redirect_to_a_private_hostname_is_not_followed() {
+        let (canary_port, hits) = canary().await;
+        let origin_port =
+            origin_redirecting_to(format!("http://localhost:{canary_port}/moved")).await;
+
+        let policy = crate::scope::ScopePolicy::for_target(&format!("http://127.0.0.1:{origin_port}/"));
+        let eng = ReplayEngine::new(policy)
+            .no_proxy()
+            .with_pace(std::time::Duration::ZERO);
+        let ex = eng
+            .send(&ReqSpec::get(&format!("http://127.0.0.1:{origin_port}/")))
+            .await
+            .expect("the in-scope initial request must succeed");
+
+        assert_eq!(ex.status, 302, "the redirect must come back as data");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the engine followed a redirect whose hostname resolves to loopback"
+        );
+    }
+
+    /// The pin-only discriminator: the target is IN SCOPE (`hard` holds
+    /// 127.0.0.1 from `for_target`) but nobody named it, so only the private
+    /// resolution stops the follow. Removing the scope check leaves this green;
+    /// removing `pin_with` reddens it — each layer gets a test where it alone
+    /// is load-bearing.
+    #[tokio::test]
+    async fn an_in_scope_private_redirect_is_refused_unless_explicitly_named() {
+        let (canary_port, hits) = canary().await;
+        let origin_port =
+            origin_redirecting_to(format!("http://127.0.0.1:{canary_port}/moved")).await;
+
+        let policy =
+            crate::scope::ScopePolicy::for_target(&format!("http://127.0.0.1:{origin_port}/"));
+        let eng = ReplayEngine::new(policy)
+            .no_proxy()
+            .with_pace(std::time::Duration::ZERO);
+        let ex = eng
+            .send(&ReqSpec::get(&format!("http://127.0.0.1:{origin_port}/")))
+            .await
+            .expect("initial request");
+
+        assert_eq!(ex.status, 302);
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "in scope is reachability; only an explicit grant may allow a private redirect"
+        );
+    }
+
+    /// C2 — the allow direction: a redirect to a host the policy explicitly
+    /// authorizes is followed, so the guard is not refusing everything.
+    #[tokio::test]
+    async fn a_redirect_to_a_hard_scoped_host_is_followed() {
+        let (canary_port, hits) = canary().await;
+        let origin_port =
+            origin_redirecting_to(format!("http://127.0.0.1:{canary_port}/moved")).await;
+
+        let mut policy =
+            crate::scope::ScopePolicy::for_target(&format!("http://127.0.0.1:{origin_port}/"));
+        // A human named the canary host; that — not `hard` — is what may exempt
+        // it from the private-address refusal.
+        policy.authorize_explicitly(&format!("127.0.0.1"));
+        let eng = ReplayEngine::new(policy)
+            .no_proxy()
+            .with_pace(std::time::Duration::ZERO);
+        let _ = eng
+            .send(&ReqSpec::get(&format!("http://127.0.0.1:{origin_port}/")))
+            .await
+            .expect("initial request");
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a redirect to an explicitly authorized host must be followed"
+        );
     }
 }

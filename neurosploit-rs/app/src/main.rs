@@ -1578,6 +1578,32 @@ pub(crate) fn print_findings(out: &RunOutput) {
 /// The token is verified HERE, before anything runs, so an invalid grant fails
 /// at the command line with a readable message instead of halfway through an
 /// engagement.
+/// Apply the operator's `--in-scope` entries.
+///
+/// Two signals come out of one flag, and they mean different things:
+/// `allow` makes the host *reachable* in this run, while `authorize_explicitly`
+/// records that a **human named it**. Only the latter may exempt a host from the
+/// private-address refusal on a redirect — the target is folded into `hard`
+/// automatically, so `hard` membership is not intent.
+fn seed_in_scope(cfg: &mut harness::types::RunConfig, in_scope: &[String]) {
+    if in_scope.is_empty() {
+        return;
+    }
+    // Seed from the target first: adding one host to an empty policy would
+    // otherwise leave the target itself out of scope.
+    if cfg.scope.hard.is_empty() {
+        cfg.scope.allow(&harness::scope::host_of(&cfg.target));
+    }
+    for entry in in_scope {
+        // `allow` does not reduce a URL to its host, so `--in-scope
+        // http://host.corp` previously authorised nothing at all. Normalise
+        // once and feed both signals the same value.
+        let host = harness::scope::host_of(entry);
+        cfg.scope.allow(&host);
+        cfg.scope.authorize_explicitly(&host);
+    }
+}
+
 fn apply_authorization(
     cfg: &mut RunConfig,
     in_scope: &[String],
@@ -1597,16 +1623,7 @@ fn apply_authorization(
     };
     cfg.policy.safety.environment = env;
 
-    if !in_scope.is_empty() {
-        // Seed from the target first: adding one host to an empty policy would
-        // otherwise leave the target itself out of scope.
-        if cfg.scope.hard.is_empty() {
-            cfg.scope.allow(&harness::scope::host_of(&cfg.target));
-        }
-        for entry in in_scope {
-            cfg.scope.allow(entry);
-        }
-    }
+    seed_in_scope(cfg, &in_scope);
 
     cfg.capability = token.or_else(|| std::env::var("NEUROSPLOIT_CAPABILITY").ok()).filter(|t| !t.trim().is_empty());
     match harness::pipeline::verify_capability(cfg) {
@@ -2718,4 +2735,36 @@ fn write_status(workdir: &Path, state: &str, extra: &str) {
     let _ = std::fs::write(&p, format!("{{\"state\":\"{state}\",\"ts\":{}{}}}", now_ts(),
         if extra.is_empty() { String::new() } else { format!(",{extra}") }));
 }
+#[cfg(test)]
+mod scope_seeding_tests {
+    use super::*;
 
+    #[test]
+    fn in_scope_entries_are_both_reachability_and_intent() {
+        let mut cfg = harness::types::RunConfig::new("http://target.corp/");
+        seed_in_scope(&mut cfg, &["http://extra.corp".to_string()]);
+        assert!(
+            cfg.scope.explicitly_authorized("extra.corp"),
+            "a host the operator named is explicit"
+        );
+        assert!(
+            cfg.scope.check_connect("extra.corp", 443).allowed(),
+            "and it is reachable"
+        );
+        assert!(
+            cfg.scope.check_connect("target.corp", 443).allowed(),
+            "the target stays reachable"
+        );
+        assert!(
+            !cfg.scope.explicitly_authorized("target.corp"),
+            "the folded target is reachability, NOT intent — a redirect to it is still judged"
+        );
+    }
+
+    #[test]
+    fn without_in_scope_nothing_is_explicit() {
+        let mut cfg = harness::types::RunConfig::new("http://target.corp/");
+        seed_in_scope(&mut cfg, &[]);
+        assert!(!cfg.scope.explicitly_authorized("target.corp"));
+    }
+}

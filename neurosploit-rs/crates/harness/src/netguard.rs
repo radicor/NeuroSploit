@@ -214,12 +214,23 @@ impl RebindGuard {
 /// be resolved *before* it can be judged, and this is that step. Without it a
 /// hostname pointing at loopback is followed exactly like a literal would be.
 pub fn pin(host: &str) -> Result<Vec<IpAddr>, String> {
+    pin_with(host, None)
+}
+
+/// As `pin`, but a private answer is allowed when a human explicitly named the
+/// host (`ScopePolicy::explicit`). `hard` is deliberately NOT consulted: the
+/// target is folded into it automatically, so it is not intent.
+pub fn pin_with(
+    host: &str,
+    policy: Option<&crate::scope::ScopePolicy>,
+) -> Result<Vec<IpAddr>, String> {
     let host = normalize_host(host);
+    let explicit = policy.map(|p| p.explicitly_authorized(&host)).unwrap_or(false);
     if host.is_empty() {
         return Err("redirect has no host".into());
     }
     if let Some(ip) = parse_ip_any(&host) {
-        return if is_private(&ip) {
+        return if is_private(&ip) && !explicit {
             Err(format!("{host} is a private address — not followed"))
         } else {
             Ok(vec![ip])
@@ -229,7 +240,7 @@ pub fn pin(host: &str) -> Result<Vec<IpAddr>, String> {
     if ips.is_empty() {
         return Err(format!("{host} does not resolve — refusing rather than guessing"));
     }
-    if let Some(bad) = ips.iter().find(|ip| is_private(ip)) {
+    if let Some(bad) = ips.iter().find(|ip| is_private(ip)).filter(|_| !explicit) {
         return Err(format!("{host} resolves to a private address ({bad}) — not followed"));
     }
     Ok(ips)
@@ -276,6 +287,42 @@ fn resolve_relative(base: &str, location: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_literal_private_redirect_target_is_refused_without_a_policy() {
+        // C4 — the no-policy path (recorders) keeps the literal check.
+        assert!(pin("127.0.0.1").is_err());
+        assert!(pin("::1").is_err());
+        assert!(pin("169.254.169.254").is_err());
+    }
+
+    #[test]
+    fn hard_membership_alone_does_not_exempt_a_private_address() {
+        // The regression guard for the mistake this spec made once: `for_target`
+        // puts the target in `hard`, so `hard` is reachability, not intent.
+        let p = crate::scope::ScopePolicy::for_target("http://127.0.0.1:8080/");
+        assert!(!p.explicitly_authorized("127.0.0.1"));
+        assert!(
+            pin_with("127.0.0.1", Some(&p)).is_err(),
+            "a folded target must not be exempted from the private-address refusal"
+        );
+    }
+
+    #[test]
+    fn pin_with_exempts_only_a_host_a_human_named() {
+        // C3 — the exemption is the explicit list, and it is per host.
+        let mut p = crate::scope::ScopePolicy::default();
+        assert!(pin_with("127.0.0.1", Some(&p)).is_err());
+        p.authorize_explicitly("127.0.0.1");
+        assert!(
+            pin_with("127.0.0.1", Some(&p)).is_ok(),
+            "an explicitly authorized host may resolve internally"
+        );
+        assert!(
+            pin_with("10.0.0.1", Some(&p)).is_err(),
+            "the exemption is not a blanket allow"
+        );
+    }
 
     #[test]
     fn pin_refuses_a_hostname_that_resolves_to_loopback() {

@@ -106,7 +106,7 @@ fn client() -> reqwest::Client {
 /// A client whose redirects are judged by `policy`. The in-scope probe uses
 /// this, so a 302 off the authorized surface is returned as data rather than
 /// followed — and a hostname pointing at loopback is stopped before it resolves.
-fn client_for(
+pub(crate) fn client_for(
     policy: Option<std::sync::Arc<crate::scope::ScopePolicy>>,
     insecure: bool,
 ) -> reqwest::Client {
@@ -144,7 +144,7 @@ fn base_builder_for(
                 // Resolve before following: a hostname pointing at loopback is
                 // the same pivot as a literal, and only resolution can see it.
                 let next_host = crate::scope::host_of(next);
-                if crate::netguard::pin(&next_host).is_err() {
+                if crate::netguard::pin_with(&next_host, Some(pol.as_ref())).is_err() {
                     return attempt.stop();
                 }
                 let prev = attempt
@@ -194,7 +194,17 @@ pub fn proxy_url(raw: &str) -> Option<&str> {
 /// cannot reach a local mock, and a stray `NEUROSPLOIT_PROXY` would silently
 /// redirect the assertion at whatever the proxy returns.
 pub fn http_client_direct() -> reqwest::Client {
-    base_builder()
+    client_for_direct(None, false)
+}
+
+/// A client that never proxies, but still carries `policy`: a loopback test
+/// must keep the redirect guard it is testing. `http_client_direct()` remains
+/// the no-policy form for callers that have none.
+pub(crate) fn client_for_direct(
+    policy: Option<std::sync::Arc<crate::scope::ScopePolicy>>,
+    insecure: bool,
+) -> reqwest::Client {
+    base_builder_for(policy, insecure)
         .no_proxy()
         .build()
         .unwrap_or_default()
