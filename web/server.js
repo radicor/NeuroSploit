@@ -253,6 +253,25 @@ function requireReplValue(value, field) {
   return r.value;
 }
 
+/// Numeric REPL fields carry no free text at all: a whole number, length-capped.
+/// `requireReplValue` would accept "3" — but it also accepts "1e9", and a
+/// numeric field that accepts arbitrary text leaves the next template edit one
+/// keystroke from a live injection.
+function requireReplInt(value, field) {
+  const v = String(value).trim();
+  if (!/^\d{1,9}$/.test(v)) throw badInput(field, 'must be a whole number (digits only)');
+  return v;
+}
+
+/// `budget` accepts a number or the literal `unlimited`, which is special-cased
+/// downstream to emit no line at all.
+function requireReplBudget(value) {
+  const v = String(value).trim();
+  if (v === 'unlimited') return v;
+  if (!/^\d{1,12}$/.test(v)) throw badInput('budget', 'must be a whole number or "unlimited"');
+  return v;
+}
+
 // Per-server temp root: mkdtemp is 0700 by construction, unlike the shared
 // os.tmpdir()/neurosploit-web directory this replaces.
 let TEMP_ROOT = null;
@@ -1657,6 +1676,17 @@ function authArgs(body) {
   const args = [];
   if (body.capability) args.push('--capability-token', requirePositional(String(body.capability), 'capability'));
   for (const entry of body.inScope || []) args.push('--session-in-scope', entry);
+  // The scope file is materialized by startJobViaRepl and handed to this
+  // function as `scopePath`; without this line the wizard's exclusions,
+  // observe-only and destructive rules never reach the child.
+  if (body.scopePath) {
+    args.push('--scope-file', requireConfinedPath(String(body.scopePath), 'scopePath'));
+  }
+  // SEC-010's gate, applied at this layer too: modeFor refuses `isolated` and
+  // `yolo` without consent, so a web-initiated yolo cannot silently run scoped.
+  const execMode = modeFor(body.executionMode, body.acceptUnfenced);
+  if (!execMode.ok) throw badInput('executionMode', execMode.error);
+  args.push('--execution-mode', execMode.mode);
   if (body.environment) args.push('--session-environment', body.environment);
   if (body.policyProfile) args.push('--session-policy', body.policyProfile);
   // Egress and the OOB channel are launcher-level, like the grant: a session
@@ -1692,11 +1722,35 @@ function sanitizeLaunch(body) {
     outOfScope: body.outOfScope,
     agents: body.agents || [],
     name: body.name || '',
-    sandbox: !!body.sandbox,
+    // The sandbox name, not a boolean: `!!body.sandbox` turned every profile
+    // into `true` and relaunched with `--sandbox true`.
+    sandbox: body.sandbox || '',
     typesafe: body.typesafe,
     quick: !!body.quick,
     research: !!body.research,
     maxAgents: body.maxAgents || undefined,
+    // Authorization surface. A resumed job must carry the ceiling the operator
+    // approved at launch, or "resume" silently grants itself more.
+    inScope: body.inScope || [],
+    scopePath: body.scopePath,
+    policyProfile: body.policyProfile,
+    executionMode: body.executionMode,
+    acceptUnfenced: !!body.acceptUnfenced,
+    intercept: body.intercept,
+    transport: body.transport,
+    environment: body.environment,
+    oobDomain: body.oobDomain,
+    oobHttp: body.oobHttp,
+    oobDns: body.oobDns,
+    sms: body.sms,
+    decisionBackend: body.decisionBackend,
+    classes: body.classes,
+    compliance: body.compliance || [],
+    budget: body.budget,
+    tokenLimit: body.tokenLimit,
+    // `capability` is deliberately absent: it is a bearer credential and this
+    // record is persisted across restarts. A relaunch re-requires the grant
+    // rather than storing the token on disk.
   };
 }
 
@@ -1720,10 +1774,10 @@ function buildReplScript(body) {
   if ((body.models || []).length) lines.push(`/model ${body.models.map((m) => requireReplValue(String(m), 'models')).join(',')}`);
   lines.push(`/sub ${body.subscription ? 'on' : 'off'}`);
   lines.push(`/mcp ${body.mcp ? 'on' : 'off'}`);
-  if (body.votes) lines.push(`/votes ${body.votes}`);
-  if (body.chainDepth !== undefined) lines.push(`/chain ${body.chainDepth}`);
-  if (body.recon) lines.push(`/recon ${body.recon}`);
-  if (body.maxAgents) lines.push(`/agents ${body.maxAgents}`);
+  if (body.votes) lines.push(`/votes ${requireReplInt(body.votes, 'votes')}`);
+  if (body.chainDepth !== undefined) lines.push(`/chain ${requireReplInt(body.chainDepth, 'chainDepth')}`);
+  if (body.recon) lines.push(`/recon ${requireReplValue(String(body.recon), 'recon')}`);
+  if (body.maxAgents) lines.push(`/agents ${requireReplInt(body.maxAgents, 'maxAgents')}`);
   if (body.focus) lines.push(`/focus ${requireReplValue(String(body.focus), 'focus')}`);
   if (body.objective) lines.push(`/objective ${requireReplValue(String(body.objective), 'objective')}`);
   if (body.outOfScope) lines.push(`/scope-out ${requireReplValue(String(body.outOfScope), 'outOfScope')}`);
@@ -1740,8 +1794,8 @@ function buildReplScript(body) {
     lines.push(`/class ${cls.map((c) => requireReplValue(String(c), 'classes')).join(',')}`);
   }
   if (body.revalidatePoc) lines.push('/revalidate on');
-  if (body.budget && body.budget !== 'unlimited') lines.push(`/budget ${body.budget}`);
-  if (body.tokenLimit) lines.push(`/budget token ${body.tokenLimit}`);
+  if (body.budget && body.budget !== 'unlimited') lines.push(`/budget ${requireReplBudget(body.budget)}`);
+  if (body.tokenLimit) lines.push(`/budget token ${requireReplInt(body.tokenLimit, 'tokenLimit')}`);
   for (const fw of body.compliance || []) lines.push(`/compliance ${requireReplValue(String(fw), 'compliance')}`);
   lines.push((body.agents || []).length
     ? `/only ${body.agents.map((a) => requireReplValue(String(a), 'agents')).join(',')}`
@@ -3253,6 +3307,8 @@ module.exports = {
   idempotencyKey, bodyDigest, withIdempotency, duplicateLaunch, withConfigLock, pruneJobs, mutateConfig,
   keyProbe,
   modeFor,
+  authArgs,
+  sanitizeLaunch,
   tierFor, tierRuleFor, redactSecret, redactEntry, isMasked, unmaskOnWrite, requireConfirm, redactIntegration, redactVault, unmaskVault,
   materializeCreds, cleanupJobTemp,
 };
